@@ -1,0 +1,18 @@
+[package]
+name = "LocalTranslateApp"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+# ONNX Runtime: DirectML ile Windows'ta AMD/NVIDIA/Intel GPU desteği
+ort = { version = "=2.0.0-rc.12", features = ["directml", "download-binaries", "ndarray"] }
+# HuggingFace tokenizer runtime
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+# HuggingFace model hub — modelleri ~/.cache/huggingface/hub/ altına indirir ve önbelleğe alır
+hf-hub = "0.5"
+ndarray = "0.17"
+anyhow = "1.0"
+eframe = "0.33"
+serde_json = "1.0"
+prost = "0.14"
+wgpu = "=27.0.1"
