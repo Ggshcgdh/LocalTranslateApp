@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use hf_hub::api::Progress;
 use hf_hub::api::sync::{Api, ApiBuilder};
+use hf_hub::{Cache, Repo};
 use ndarray::{Array2, Array3, ArrayView1, ArrayView3, Axis, Ix3};
 #[cfg(target_os = "windows")]
 use ort::ep::ExecutionProvider;
@@ -101,14 +104,36 @@ pub struct Translator {
     device_label: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct StartupProgress {
+    pub message: String,
+    pub progress: f32,
+}
+
 impl Translator {
-    pub fn new() -> Result<Self> {
+    pub fn new_with_progress<F>(mut on_progress: F) -> Result<Self>
+    where
+        F: FnMut(StartupProgress),
+    {
+        on_progress(StartupProgress {
+            message: "Initializing ONNX Runtime.".to_owned(),
+            progress: 0.03,
+        });
+
         let device_label =
             configure_ort().context("Failed to initialize ONNX Runtime execution providers")?;
         let decoder_config = DecoderConfig::from_env();
 
-        let api = Api::new().context("Failed to initialize Hugging Face Hub API client")?;
-        let (tr_en, en_tr) = match load_model_bundles(&api) {
+        on_progress(StartupProgress {
+            message: "Preparing model cache.".to_owned(),
+            progress: 0.08,
+        });
+
+        let default_cache = Cache::from_env();
+        let api = ApiBuilder::from_cache(default_cache.clone())
+            .build()
+            .context("Failed to initialize Hugging Face Hub API client")?;
+        let (tr_en, en_tr) = match load_model_bundles(&api, &default_cache, &mut on_progress) {
             Ok(bundles) => bundles,
             Err(error) if is_file_exists_io_error(&error) => {
                 let fallback_cache = fallback_hf_cache_dir();
@@ -127,12 +152,16 @@ impl Translator {
                             fallback_cache.display()
                         )
                     })?;
-                load_model_bundles(&fallback_api).with_context(|| {
-                    format!(
-                        "Retry with fallback Hugging Face cache failed at {}",
-                        fallback_cache.display()
-                    )
-                })?
+                let fallback_cache = Cache::new(fallback_cache.clone());
+                let fallback_cache_path = fallback_cache.path().clone();
+                load_model_bundles(&fallback_api, &fallback_cache, &mut on_progress).with_context(
+                    || {
+                        format!(
+                            "Retry with fallback Hugging Face cache failed at {}",
+                            fallback_cache_path.display()
+                        )
+                    },
+                )?
             }
             Err(error) => return Err(error),
         };
@@ -174,11 +203,20 @@ impl Translator {
     }
 }
 
-fn load_model_bundles(api: &Api) -> Result<(ModelBundle, ModelBundle)> {
-    let tr_en = load_model_pair(api, TR_EN_ONNX_REPO_ID, TR_EN_BASE_REPO_ID)
+fn load_model_bundles<F>(
+    api: &Api,
+    cache: &Cache,
+    on_progress: &mut F,
+) -> Result<(ModelBundle, ModelBundle)>
+where
+    F: FnMut(StartupProgress),
+{
+    let mut tracker = ModelLoadProgressTracker::new(on_progress, 12);
+    let tr_en = load_model_pair(api, cache, TR_EN_ONNX_REPO_ID, TR_EN_BASE_REPO_ID, &mut tracker)
         .with_context(|| format!("Failed loading model pair {TR_EN_ONNX_REPO_ID}"))?;
-    let en_tr = load_model_pair(api, EN_TR_ONNX_REPO_ID, EN_TR_BASE_REPO_ID)
+    let en_tr = load_model_pair(api, cache, EN_TR_ONNX_REPO_ID, EN_TR_BASE_REPO_ID, &mut tracker)
         .with_context(|| format!("Failed loading model pair {EN_TR_ONNX_REPO_ID}"))?;
+    tracker.finish();
     Ok((tr_en, en_tr))
 }
 
@@ -309,27 +347,27 @@ fn parse_env_usize(name: &str, default: usize, min: usize, max: usize) -> usize 
         .unwrap_or(default)
 }
 
-fn load_model_pair(api: &Api, onnx_repo_id: &str, base_repo_id: &str) -> Result<ModelBundle> {
-    let onnx_model = api.model(onnx_repo_id.to_owned());
-    let encoder_path = onnx_model
-        .get("onnx/encoder_model.onnx")
+fn load_model_pair<F>(
+    api: &Api,
+    cache: &Cache,
+    onnx_repo_id: &str,
+    base_repo_id: &str,
+    tracker: &mut ModelLoadProgressTracker<'_, F>,
+) -> Result<ModelBundle>
+where
+    F: FnMut(StartupProgress),
+{
+    let encoder_path = resolve_model_file(api, cache, onnx_repo_id, "onnx/encoder_model.onnx", tracker)
         .with_context(|| format!("Could not fetch encoder ONNX file from {onnx_repo_id}"))?;
-    let decoder_path = onnx_model
-        .get("onnx/decoder_model.onnx")
+    let decoder_path = resolve_model_file(api, cache, onnx_repo_id, "onnx/decoder_model.onnx", tracker)
         .with_context(|| format!("Could not fetch decoder ONNX file from {onnx_repo_id}"))?;
-    let tokenizer_json_path = onnx_model
-        .get("tokenizer.json")
+    let tokenizer_json_path = resolve_model_file(api, cache, onnx_repo_id, "tokenizer.json", tracker)
         .with_context(|| format!("Could not fetch tokenizer.json from {onnx_repo_id}"))?;
-
-    let base_model = api.model(base_repo_id.to_owned());
-    let source_spm_path = base_model
-        .get("source.spm")
+    let source_spm_path = resolve_model_file(api, cache, base_repo_id, "source.spm", tracker)
         .with_context(|| format!("Could not fetch source.spm from {base_repo_id}"))?;
-    let target_spm_path = base_model
-        .get("target.spm")
+    let target_spm_path = resolve_model_file(api, cache, base_repo_id, "target.spm", tracker)
         .with_context(|| format!("Could not fetch target.spm from {base_repo_id}"))?;
-    let vocab_path = base_model
-        .get("vocab.json")
+    let vocab_path = resolve_model_file(api, cache, base_repo_id, "vocab.json", tracker)
         .with_context(|| format!("Could not fetch vocab.json from {base_repo_id}"))?;
 
     let encoder = Session::builder()?
@@ -360,6 +398,164 @@ fn load_model_pair(api: &Api, onnx_repo_id: &str, base_repo_id: &str) -> Result<
         pad_token_id,
         eos_token_id,
     })
+}
+
+fn resolve_model_file<F>(
+    api: &Api,
+    cache: &Cache,
+    repo_id: &str,
+    filename: &str,
+    tracker: &mut ModelLoadProgressTracker<'_, F>,
+) -> Result<PathBuf>
+where
+    F: FnMut(StartupProgress),
+{
+    let repo = Repo::model(repo_id.to_owned());
+    if let Some(path) = cache.repo(repo.clone()).get(filename) {
+        tracker.mark_cached(repo_id, filename);
+        return Ok(path);
+    }
+
+    tracker.start_download(repo_id, filename);
+    let progress = HubDownloadProgress::new(tracker, repo_id, filename);
+    let downloaded = api
+        .repo(repo)
+        .download_with_progress(filename, progress)
+        .with_context(|| format!("Download failed for {repo_id}/{filename}"))?;
+    Ok(downloaded)
+}
+
+struct ModelLoadProgressTracker<'a, F: FnMut(StartupProgress)> {
+    on_progress: &'a mut F,
+    total_files: usize,
+    completed_files: usize,
+}
+
+impl<'a, F: FnMut(StartupProgress)> ModelLoadProgressTracker<'a, F> {
+    fn new(on_progress: &'a mut F, total_files: usize) -> Self {
+        let mut tracker = Self {
+            on_progress,
+            total_files,
+            completed_files: 0,
+        };
+        tracker.emit(
+            "Checking local model files.".to_owned(),
+            tracker.progress_value(0.0),
+        );
+        tracker
+    }
+
+    fn mark_cached(&mut self, repo_id: &str, filename: &str) {
+        self.completed_files += 1;
+        self.emit(
+            format!("Using cached asset: {repo_id}/{filename}"),
+            self.progress_value(0.0),
+        );
+    }
+
+    fn start_download(&mut self, repo_id: &str, filename: &str) {
+        self.emit(
+            format!("Downloading model asset: {repo_id}/{filename}"),
+            self.progress_value(0.0),
+        );
+    }
+
+    fn update_download(&mut self, repo_id: &str, filename: &str, fraction_in_file: f32) {
+        let percent = (fraction_in_file * 100.0).round() as u8;
+        self.emit(
+            format!("Downloading {repo_id}/{filename} ({percent}%)"),
+            self.progress_value(fraction_in_file),
+        );
+    }
+
+    fn finish_download(&mut self, repo_id: &str, filename: &str) {
+        self.completed_files += 1;
+        self.emit(
+            format!("Model asset ready: {repo_id}/{filename}"),
+            self.progress_value(0.0),
+        );
+    }
+
+    fn finish(&mut self) {
+        self.emit("Model runtime ready.".to_owned(), 1.0);
+    }
+
+    fn progress_value(&self, file_fraction: f32) -> f32 {
+        let startup_floor = 0.08;
+        let startup_ceiling = 0.96;
+        let span = startup_ceiling - startup_floor;
+        let done = self.completed_files as f32 + file_fraction.clamp(0.0, 1.0);
+        let raw = done / self.total_files as f32;
+        (startup_floor + span * raw).clamp(0.0, startup_ceiling)
+    }
+
+    fn emit(&mut self, message: String, progress: f32) {
+        (self.on_progress)(StartupProgress { message, progress });
+    }
+}
+
+struct HubDownloadProgress<'a, 'b, F: FnMut(StartupProgress)> {
+    tracker: &'a mut ModelLoadProgressTracker<'b, F>,
+    repo_id: String,
+    filename: String,
+    total_size: usize,
+    downloaded: usize,
+    last_emit: Option<Instant>,
+}
+
+impl<'a, 'b, F: FnMut(StartupProgress)> HubDownloadProgress<'a, 'b, F> {
+    fn new(
+        tracker: &'a mut ModelLoadProgressTracker<'b, F>,
+        repo_id: &str,
+        filename: &str,
+    ) -> Self {
+        Self {
+            tracker,
+            repo_id: repo_id.to_owned(),
+            filename: filename.to_owned(),
+            total_size: 0,
+            downloaded: 0,
+            last_emit: None,
+        }
+    }
+
+    fn file_fraction(&self) -> f32 {
+        if self.total_size == 0 {
+            0.0
+        } else {
+            (self.downloaded as f32 / self.total_size as f32).clamp(0.0, 1.0)
+        }
+    }
+}
+
+impl<F: FnMut(StartupProgress)> Progress for HubDownloadProgress<'_, '_, F> {
+    fn init(&mut self, size: usize, _filename: &str) {
+        self.total_size = size.max(1);
+        self.downloaded = 0;
+        self.last_emit = None;
+        self.tracker
+            .update_download(&self.repo_id, &self.filename, self.file_fraction());
+    }
+
+    fn update(&mut self, size: usize) {
+        self.downloaded = self.downloaded.saturating_add(size).min(self.total_size);
+        let now = Instant::now();
+        let should_emit = self
+            .last_emit
+            .map(|last| now.duration_since(last) >= Duration::from_millis(90))
+            .unwrap_or(true);
+        if should_emit {
+            self.last_emit = Some(now);
+            self.tracker
+                .update_download(&self.repo_id, &self.filename, self.file_fraction());
+        }
+    }
+
+    fn finish(&mut self) {
+        self.downloaded = self.total_size;
+        self.tracker
+            .finish_download(&self.repo_id, &self.filename);
+    }
 }
 
 fn load_sentencepiece_tokenizer(

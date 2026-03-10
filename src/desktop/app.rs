@@ -8,6 +8,7 @@ use eframe::egui::{
 };
 
 use crate::translate::{TargetLang, Translator};
+use crate::translate::StartupProgress;
 
 pub struct TranslateDesktopApp {
     source_text: String,
@@ -18,6 +19,7 @@ pub struct TranslateDesktopApp {
     translation_started_at: Option<Instant>,
     status: WorkerStatus,
     last_error: Option<String>,
+    startup_progress: Option<StartupProgress>,
     worker: WorkerHandle,
 }
 
@@ -34,6 +36,7 @@ impl TranslateDesktopApp {
             translation_started_at: None,
             status: WorkerStatus::Loading,
             last_error: None,
+            startup_progress: None,
             worker: WorkerHandle::spawn(),
         }
     }
@@ -44,6 +47,13 @@ impl TranslateDesktopApp {
                 Ok(WorkerEvent::Ready { device_label }) => {
                     self.status = WorkerStatus::Ready { device_label };
                     self.last_error = None;
+                    self.startup_progress = Some(StartupProgress {
+                        message: "Runtime is ready.".to_owned(),
+                        progress: 1.0,
+                    });
+                }
+                Ok(WorkerEvent::StartupProgress(progress)) => {
+                    self.startup_progress = Some(progress);
                 }
                 Ok(WorkerEvent::TranslationCompleted(result)) => {
                     self.is_translating = false;
@@ -193,7 +203,12 @@ impl TranslateDesktopApp {
                 Color32::from_rgb(232, 239, 246),
                 Stroke::new(1.0, Color32::from_rgb(193, 206, 220)),
                 accent_color(),
-                "Loading model assets and selecting the best execution device.".to_owned(),
+                self.startup_progress
+                    .as_ref()
+                    .map(|progress| progress.message.clone())
+                    .unwrap_or_else(|| {
+                        "Loading model assets and selecting the best execution device.".to_owned()
+                    }),
             ),
             WorkerStatus::Ready { device_label } => (
                 "Agent ready",
@@ -312,7 +327,13 @@ impl TranslateDesktopApp {
                 });
 
                 ui.add_space(8.0);
-                self.render_marquee_bar(ui, 6.0);
+                if self.is_translating {
+                    self.render_marquee_bar(ui, 6.0);
+                } else if let Some(progress) = self.startup_progress_fraction() {
+                    self.render_progress_bar(ui, 8.0, progress);
+                } else {
+                    self.render_marquee_bar(ui, 6.0);
+                }
             },
         );
     }
@@ -499,7 +520,7 @@ impl TranslateDesktopApp {
         }
     }
 
-    fn activity_copy(&self, elapsed: Duration) -> (&'static str, &'static str) {
+    fn activity_copy(&self, elapsed: Duration) -> (String, String) {
         if self.is_translating {
             const PHASES: [&str; 4] = [
                 "Inspecting sentence structure.",
@@ -509,11 +530,19 @@ impl TranslateDesktopApp {
             ];
 
             let phase_index = ((elapsed.as_secs() / 3) as usize) % PHASES.len();
-            ("Translation agent active", PHASES[phase_index])
+            (
+                "Translation agent active".to_owned(),
+                PHASES[phase_index].to_owned(),
+            )
         } else {
             (
-                "Preparing the translation runtime",
-                "Loading model assets and selecting the best execution device.",
+                "Preparing the translation runtime".to_owned(),
+                self.startup_progress
+                    .as_ref()
+                    .map(|progress| progress.message.clone())
+                    .unwrap_or_else(|| {
+                        "Loading model assets and selecting the best execution device.".to_owned()
+                    }),
             )
         }
     }
@@ -557,6 +586,16 @@ impl TranslateDesktopApp {
         (elapsed.as_secs_f32() % cycle) / cycle
     }
 
+    fn startup_progress_fraction(&self) -> Option<f32> {
+        if !matches!(self.status, WorkerStatus::Loading) {
+            return None;
+        }
+
+        self.startup_progress
+            .as_ref()
+            .map(|progress| progress.progress.clamp(0.0, 1.0))
+    }
+
     fn render_marquee_bar(&self, ui: &mut egui::Ui, height: f32) {
         let width = safe_available_width(ui);
         let (track_rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
@@ -576,6 +615,25 @@ impl TranslateDesktopApp {
         if segment_rect.width() > 0.0 {
             ui.painter()
                 .rect_filled(segment_rect, track_radius, accent_color());
+        }
+    }
+
+    fn render_progress_bar(&self, ui: &mut egui::Ui, height: f32, progress: f32) {
+        let width = safe_available_width(ui);
+        let (track_rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+        let track_radius = CornerRadius::same((height / 2.0).round() as u8);
+
+        ui.painter()
+            .rect_filled(track_rect, track_radius, Color32::from_rgb(223, 229, 236));
+
+        let fill_width = track_rect.width() * progress.clamp(0.0, 1.0);
+        if fill_width > 0.0 {
+            let fill_rect = Rect::from_min_size(
+                egui::pos2(track_rect.left(), track_rect.top()),
+                Vec2::new(fill_width, track_rect.height()),
+            );
+            ui.painter()
+                .rect_filled(fill_rect, track_radius, accent_color());
         }
     }
 }
@@ -657,6 +715,7 @@ enum WorkerCommand {
 }
 
 enum WorkerEvent {
+    StartupProgress(StartupProgress),
     Ready { device_label: String },
     TranslationCompleted(Result<String, String>),
     StartupFailed(String),
@@ -670,7 +729,9 @@ fn run_worker_loop(
 }
 
 fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
-    let mut translator = match Translator::new() {
+    let mut translator = match Translator::new_with_progress(|progress| {
+        let _ = events.send(WorkerEvent::StartupProgress(progress));
+    }) {
         Ok(translator) => {
             let _ = events.send(WorkerEvent::Ready {
                 device_label: translator.device_label().to_owned(),
@@ -933,6 +994,7 @@ mod tests {
                 device_label: "CPU".into(),
             },
             last_error: Some("old error".into()),
+            startup_progress: None,
             worker: WorkerHandle {
                 commands: command_tx,
                 events: event_rx,
