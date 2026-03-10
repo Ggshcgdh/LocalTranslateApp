@@ -1,11 +1,15 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use hf_hub::api::sync::Api;
+use hf_hub::api::sync::{Api, ApiBuilder};
 use ndarray::{Array2, Array3, ArrayView1, ArrayView3, Axis, Ix3};
+#[cfg(target_os = "windows")]
 use ort::ep::ExecutionProvider;
+#[cfg(target_os = "windows")]
 use ort::ep::directml::PerformancePreference;
-use ort::execution_providers::{CPUExecutionProvider, DirectMLExecutionProvider};
+use ort::execution_providers::CPUExecutionProvider;
+#[cfg(target_os = "windows")]
+use ort::execution_providers::DirectMLExecutionProvider;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::TensorRef;
@@ -25,11 +29,17 @@ const TR_EN_ONNX_REPO_ID: &str = "onnx-community/opus-mt-tc-big-tr-en";
 const EN_TR_ONNX_REPO_ID: &str = "onnx-community/opus-mt-tc-big-en-tr";
 const TR_EN_BASE_REPO_ID: &str = "Helsinki-NLP/opus-mt-tc-big-tr-en";
 const EN_TR_BASE_REPO_ID: &str = "Helsinki-NLP/opus-mt-tc-big-en-tr";
+#[cfg(target_os = "windows")]
 const NVIDIA_VENDOR_ID: u32 = 0x10DE;
+#[cfg(target_os = "windows")]
 const AMD_VENDOR_ID: u32 = 0x1002;
+#[cfg(target_os = "windows")]
 const AMD_CPU_VENDOR_ID: u32 = 0x1022;
+#[cfg(target_os = "windows")]
 const INTEL_VENDOR_ID: u32 = 0x8086;
+#[cfg(target_os = "windows")]
 const MICROSOFT_VENDOR_ID: u32 = 0x1414;
+#[cfg(target_os = "windows")]
 const QUALCOMM_VENDOR_ID: u32 = 0x5143;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,12 +103,39 @@ pub struct Translator {
 
 impl Translator {
     pub fn new() -> Result<Self> {
-        let device_label = configure_ort()?;
+        let device_label =
+            configure_ort().context("Failed to initialize ONNX Runtime execution providers")?;
         let decoder_config = DecoderConfig::from_env();
 
-        let api = Api::new()?;
-        let tr_en = load_model_pair(&api, TR_EN_ONNX_REPO_ID, TR_EN_BASE_REPO_ID)?;
-        let en_tr = load_model_pair(&api, EN_TR_ONNX_REPO_ID, EN_TR_BASE_REPO_ID)?;
+        let api = Api::new().context("Failed to initialize Hugging Face Hub API client")?;
+        let (tr_en, en_tr) = match load_model_bundles(&api) {
+            Ok(bundles) => bundles,
+            Err(error) if is_file_exists_io_error(&error) => {
+                let fallback_cache = fallback_hf_cache_dir();
+                std::fs::create_dir_all(&fallback_cache).with_context(|| {
+                    format!(
+                        "Failed to create fallback Hugging Face cache directory at {}",
+                        fallback_cache.display()
+                    )
+                })?;
+                let fallback_api = ApiBuilder::new()
+                    .with_cache_dir(fallback_cache.clone())
+                    .build()
+                    .with_context(|| {
+                        format!(
+                            "Failed to initialize fallback Hugging Face API with cache {}",
+                            fallback_cache.display()
+                        )
+                    })?;
+                load_model_bundles(&fallback_api).with_context(|| {
+                    format!(
+                        "Retry with fallback Hugging Face cache failed at {}",
+                        fallback_cache.display()
+                    )
+                })?
+            }
+            Err(error) => return Err(error),
+        };
 
         Ok(Self {
             tr_en,
@@ -137,6 +174,31 @@ impl Translator {
     }
 }
 
+fn load_model_bundles(api: &Api) -> Result<(ModelBundle, ModelBundle)> {
+    let tr_en = load_model_pair(api, TR_EN_ONNX_REPO_ID, TR_EN_BASE_REPO_ID)
+        .with_context(|| format!("Failed loading model pair {TR_EN_ONNX_REPO_ID}"))?;
+    let en_tr = load_model_pair(api, EN_TR_ONNX_REPO_ID, EN_TR_BASE_REPO_ID)
+        .with_context(|| format!("Failed loading model pair {EN_TR_ONNX_REPO_ID}"))?;
+    Ok((tr_en, en_tr))
+}
+
+fn is_file_exists_io_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string();
+        text.contains("os error 17")
+            || text.contains("File exists (os error 17)")
+            || text.contains("I/O error File exists")
+    })
+}
+
+fn fallback_hf_cache_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".cache/localtranslate/hf-hub");
+    }
+
+    std::env::temp_dir().join("localtranslate-hf-hub")
+}
+
 fn configure_ort() -> Result<String> {
     let force_cpu = std::env::var("TRANSLATE_DEVICE")
         .map(|value| value.trim().eq_ignore_ascii_case("cpu"))
@@ -149,27 +211,40 @@ fn configure_ort() -> Result<String> {
         return Ok("CPU".to_owned());
     }
 
-    let directml = DirectMLExecutionProvider::default()
-        .with_performance_preference(PerformancePreference::HighPerformance);
-    let use_directml = directml.is_available().unwrap_or(false);
+    #[cfg(target_os = "windows")]
+    {
+        let directml = DirectMLExecutionProvider::default()
+            .with_performance_preference(PerformancePreference::HighPerformance);
+        let use_directml = directml.is_available().unwrap_or(false);
 
-    ort::init()
-        .with_execution_providers([directml.build(), CPUExecutionProvider::default().build()])
-        .commit();
+        ort::init()
+            .with_execution_providers([directml.build(), CPUExecutionProvider::default().build()])
+            .commit();
 
-    if use_directml {
-        Ok(detect_directml_device_label())
-    } else {
+        return if use_directml {
+            Ok(detect_directml_device_label())
+        } else {
+            Ok("CPU".to_owned())
+        };
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        ort::init()
+            .with_execution_providers([CPUExecutionProvider::default().build()])
+            .commit();
         Ok("CPU".to_owned())
     }
 }
 
+#[cfg(target_os = "windows")]
 fn detect_directml_device_label() -> String {
     directml_adapter_info()
         .map(|info| format_directml_device_label(&info))
         .unwrap_or_else(|| "DirectML (GPU)".to_owned())
 }
 
+#[cfg(target_os = "windows")]
 fn directml_adapter_info() -> Option<wgpu::AdapterInfo> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::DX12,
@@ -184,6 +259,7 @@ fn directml_adapter_info() -> Option<wgpu::AdapterInfo> {
         .max_by_key(score_adapter_for_directml)
 }
 
+#[cfg(target_os = "windows")]
 fn score_adapter_for_directml(info: &wgpu::AdapterInfo) -> (u8, u8) {
     let device_priority = match info.device_type {
         wgpu::DeviceType::DiscreteGpu => 5,
@@ -197,10 +273,12 @@ fn score_adapter_for_directml(info: &wgpu::AdapterInfo) -> (u8, u8) {
     (device_priority, preferred_vendor)
 }
 
+#[cfg(target_os = "windows")]
 fn is_software_or_microsoft_adapter(info: &wgpu::AdapterInfo) -> bool {
     info.vendor == MICROSOFT_VENDOR_ID || info.name.contains("Microsoft")
 }
 
+#[cfg(target_os = "windows")]
 fn format_directml_device_label(info: &wgpu::AdapterInfo) -> String {
     let adapter_name = info.name.trim();
     if !adapter_name.is_empty() {
@@ -211,6 +289,7 @@ fn format_directml_device_label(info: &wgpu::AdapterInfo) -> String {
     format!("DirectML ({vendor_name})")
 }
 
+#[cfg(target_os = "windows")]
 fn gpu_vendor_name(vendor_id: u32) -> &'static str {
     match vendor_id {
         NVIDIA_VENDOR_ID => "NVIDIA",
@@ -232,14 +311,26 @@ fn parse_env_usize(name: &str, default: usize, min: usize, max: usize) -> usize 
 
 fn load_model_pair(api: &Api, onnx_repo_id: &str, base_repo_id: &str) -> Result<ModelBundle> {
     let onnx_model = api.model(onnx_repo_id.to_owned());
-    let encoder_path = onnx_model.get("onnx/encoder_model.onnx")?;
-    let decoder_path = onnx_model.get("onnx/decoder_model.onnx")?;
-    let tokenizer_json_path = onnx_model.get("tokenizer.json")?;
+    let encoder_path = onnx_model
+        .get("onnx/encoder_model.onnx")
+        .with_context(|| format!("Could not fetch encoder ONNX file from {onnx_repo_id}"))?;
+    let decoder_path = onnx_model
+        .get("onnx/decoder_model.onnx")
+        .with_context(|| format!("Could not fetch decoder ONNX file from {onnx_repo_id}"))?;
+    let tokenizer_json_path = onnx_model
+        .get("tokenizer.json")
+        .with_context(|| format!("Could not fetch tokenizer.json from {onnx_repo_id}"))?;
 
     let base_model = api.model(base_repo_id.to_owned());
-    let source_spm_path = base_model.get("source.spm")?;
-    let target_spm_path = base_model.get("target.spm")?;
-    let vocab_path = base_model.get("vocab.json")?;
+    let source_spm_path = base_model
+        .get("source.spm")
+        .with_context(|| format!("Could not fetch source.spm from {base_repo_id}"))?;
+    let target_spm_path = base_model
+        .get("target.spm")
+        .with_context(|| format!("Could not fetch target.spm from {base_repo_id}"))?;
+    let vocab_path = base_model
+        .get("vocab.json")
+        .with_context(|| format!("Could not fetch vocab.json from {base_repo_id}"))?;
 
     let encoder = Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::All)
@@ -893,11 +984,14 @@ enum LayoutSegment {
 
 #[cfg(test)]
 mod tests {
+    use super::{DecoderConfig, TranslationLayout, parse_env_usize};
+    #[cfg(target_os = "windows")]
     use super::{
-        DecoderConfig, MICROSOFT_VENDOR_ID, NVIDIA_VENDOR_ID, TranslationLayout,
-        format_directml_device_label, parse_env_usize, score_adapter_for_directml,
+        MICROSOFT_VENDOR_ID, NVIDIA_VENDOR_ID, format_directml_device_label,
+        score_adapter_for_directml,
     };
 
+    #[cfg(target_os = "windows")]
     fn adapter_info(name: &str, vendor: u32, device_type: wgpu::DeviceType) -> wgpu::AdapterInfo {
         wgpu::AdapterInfo {
             name: name.to_owned(),
@@ -930,9 +1024,10 @@ mod tests {
     #[test]
     fn env_parser_uses_default_when_value_missing() {
         assert_eq!(parse_env_usize("MISSING_ENV", 12, 4, 24), 12);
-        assert_eq!(DecoderConfig::default().num_beams, 1);
+        assert_eq!(DecoderConfig::default().num_beams, 4);
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn uses_adapter_name_for_directml_label() {
         let info = adapter_info(
@@ -947,6 +1042,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn falls_back_to_vendor_name_when_adapter_name_is_missing() {
         let info = adapter_info("", NVIDIA_VENDOR_ID, wgpu::DeviceType::DiscreteGpu);
@@ -954,6 +1050,7 @@ mod tests {
         assert_eq!(format_directml_device_label(&info), "DirectML (NVIDIA)");
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn prefers_hardware_gpu_over_microsoft_software_adapter() {
         let discrete_gpu = adapter_info(

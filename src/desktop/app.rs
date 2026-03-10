@@ -69,8 +69,10 @@ impl TranslateDesktopApp {
                     self.status = WorkerStatus::Failed;
                     self.is_translating = false;
                     self.translation_started_at = None;
-                    self.last_error =
-                        Some("The background translation worker closed unexpectedly.".into());
+                    if self.last_error.is_none() {
+                        self.last_error =
+                            Some("The background translation worker closed unexpectedly.".into());
+                    }
                     break;
                 }
             }
@@ -676,7 +678,9 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
             translator
         }
         Err(error) => {
-            let _ = events.send(WorkerEvent::StartupFailed(error.to_string()));
+            let detailed = format!("{error:#}");
+            eprintln!("translator startup failed: {detailed}");
+            let _ = events.send(WorkerEvent::StartupFailed(detailed));
             return;
         }
     };
@@ -686,7 +690,7 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
             WorkerCommand::Translate { text, target } => {
                 let result = translator
                     .translate(&text, target)
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| format!("{error:#}"));
 
                 if events
                     .send(WorkerEvent::TranslationCompleted(result))
