@@ -275,10 +275,24 @@ impl Translator {
             TargetLang::Tr => &mut self.en_tr,
         };
 
+        // CoreML EP cannot handle batched decoder inference (batch_size > 1).
+        // When beam search is used the decoder is called with beam_count beams
+        // stacked on the batch dimension, which makes CoreML fail with
+        // "Unable to compute the prediction using a neural network model".
+        // Force greedy decode (num_beams=1) so the decoder always runs with
+        // batch_size=1.
+        let mut decoder_config = self.decoder_config;
+        #[cfg(target_os = "macos")]
+        if matches!(self.runtime_backend, RuntimeBackend::CoreML { .. })
+            && decoder_config.num_beams > 1
+        {
+            decoder_config.num_beams = 1;
+        }
+
         layout
             .translatable_segments
             .iter()
-            .map(|segment| translate_segment(model, self.decoder_config, segment))
+            .map(|segment| translate_segment(model, decoder_config, segment))
             .collect()
     }
 
