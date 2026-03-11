@@ -167,7 +167,7 @@ impl TranslateDesktopApp {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
-                    "Set TRANSLATE_DEVICE=cpu to force CPU execution. Windows uses DirectML when available; macOS uses CoreML, and TRANSLATE_COREML_UNITS=all|ane|gpu|cpu can tune the Apple backend.",
+                    "Set TRANSLATE_DEVICE=cpu to force CPU execution. Windows prefers CUDA on NVIDIA GPUs, falls back to DirectML on AMD/other DX12 GPUs, and macOS keeps CoreML. TRANSLATE_COREML_UNITS=all|ane|gpu|cpu can tune the Apple backend.",
                 )
                 .small()
                 .color(text_muted_color()),

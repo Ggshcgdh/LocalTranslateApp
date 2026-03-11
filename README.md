@@ -9,7 +9,7 @@ English ↔ Turkish translation app. Runs completely offline — internet is onl
 
 - **Local Translation**: All translation happens on your device
 - **Bidirectional**: English → Turkish and Turkish → English
-- **Platform Acceleration**: DirectML on Windows, CoreML on macOS
+- **Platform Acceleration**: CUDA on NVIDIA Windows systems, DirectML on other Windows GPUs, CoreML on macOS
 - **Modern UI**: Clean and easy-to-use desktop interface
 
 ## 🚀 Installation
@@ -18,7 +18,7 @@ English ↔ Turkish translation app. Runs completely offline — internet is onl
 
 - Windows 10/11 or macOS
 - Rust (1.75+)
-- (Optional) DirectX 12 GPU on Windows, or Apple GPU / Neural Engine support on macOS
+- (Optional) NVIDIA GPU with CUDA-capable drivers on Windows for best performance, otherwise a DirectX 12 GPU, or Apple GPU / Neural Engine support on macOS
 
 ### Build
 
@@ -43,12 +43,13 @@ On first run, the model will be downloaded automatically (approximately 500MB).
 ## 🛠️ How It Works
 
 - **Model**: [OPUS-MT](https://huggingface.co/Helsinki-NLP) transformer model
-- **Runtime**: ONNX Runtime with DirectML (Windows) or CoreML (macOS)
+- **Runtime**: ONNX Runtime with CUDA or DirectML on Windows, CoreML on macOS
 - **UI**: Rust + eframe (egui)
 
 ## ⚙️ Runtime Notes
 
 - `TRANSLATE_DEVICE=cpu` forces CPU execution on every platform.
+- Windows prefers `CUDA` on NVIDIA hardware, then falls back to `DirectML`, then CPU if GPU providers cannot start.
 - On macOS, `TRANSLATE_COREML_UNITS=all|ane|gpu|cpu` selects the preferred CoreML compute units.
 - `TRANSLATE_COREML_FORMAT=mlprogram|neuralnetwork` selects the CoreML compiled model format for debugging compatibility issues.
 - `TRANSLATE_COREML_STATIC_INPUT_SHAPES=1` limits CoreML to static-shape subgraphs, which can help isolate dynamic-shape failures.

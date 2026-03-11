@@ -7,6 +7,8 @@ use hf_hub::api::sync::{Api, ApiBuilder};
 use hf_hub::{Cache, Repo};
 use ndarray::{Array2, Array3, ArrayView1, ArrayView3, Axis, Ix3};
 use ort::ep::CPU;
+#[cfg(target_os = "windows")]
+use ort::ep::CUDA;
 #[cfg(target_os = "macos")]
 use ort::ep::CoreML;
 #[cfg(target_os = "windows")]
@@ -61,7 +63,9 @@ pub enum TargetLang {
 struct ModelBundle {
     encoder: Session,
     decoder: Session,
+    #[cfg(target_os = "macos")]
     encoder_path: PathBuf,
+    #[cfg(target_os = "macos")]
     decoder_path: PathBuf,
     source_tokenizer: Tokenizer,
     target_tokenizer: Tokenizer,
@@ -70,10 +74,12 @@ struct ModelBundle {
 }
 
 impl ModelBundle {
+    #[cfg(target_os = "macos")]
     fn build_sessions(&self, runtime_backend: RuntimeBackend) -> Result<(Session, Session)> {
         build_model_sessions(&self.encoder_path, &self.decoder_path, runtime_backend)
     }
 
+    #[cfg(target_os = "macos")]
     fn replace_sessions(&mut self, encoder: Session, decoder: Session) {
         self.encoder = encoder;
         self.decoder = decoder;
@@ -101,6 +107,8 @@ struct CoreMLSettings {
 enum RuntimeBackend {
     Cpu,
     #[cfg(target_os = "windows")]
+    Cuda,
+    #[cfg(target_os = "windows")]
     DirectML,
     #[cfg(target_os = "macos")]
     CoreML {
@@ -112,6 +120,8 @@ impl RuntimeBackend {
     fn label(self) -> String {
         match self {
             Self::Cpu => "CPU".to_owned(),
+            #[cfg(target_os = "windows")]
+            Self::Cuda => detect_cuda_device_label(),
             #[cfg(target_os = "windows")]
             Self::DirectML => detect_directml_device_label(),
             #[cfg(target_os = "macos")]
@@ -150,10 +160,25 @@ impl DecoderConfig {
     }
 }
 
+struct ConfiguredRuntime {
+    backend: RuntimeBackend,
+    device_label: String,
+}
+
+impl ConfiguredRuntime {
+    fn new(backend: RuntimeBackend) -> Self {
+        Self {
+            device_label: backend.label(),
+            backend,
+        }
+    }
+}
+
 pub struct Translator {
     tr_en: ModelBundle,
     en_tr: ModelBundle,
     decoder_config: DecoderConfig,
+    #[cfg(target_os = "macos")]
     runtime_backend: RuntimeBackend,
     device_label: String,
 }
@@ -174,7 +199,7 @@ impl Translator {
             progress: 0.03,
         });
 
-        let (runtime_backend, device_label) =
+        let configured_runtime =
             configure_ort().context("Failed to initialize ONNX Runtime execution providers")?;
         let decoder_config = DecoderConfig::from_env();
 
@@ -187,48 +212,23 @@ impl Translator {
         let api = ApiBuilder::from_cache(default_cache.clone())
             .build()
             .context("Failed to initialize Hugging Face Hub API client")?;
-        let (tr_en, en_tr) =
-            match load_model_bundles(&api, &default_cache, runtime_backend, &mut on_progress) {
-                Ok(bundles) => bundles,
-                Err(error) if is_file_exists_io_error(&error) => {
-                    let fallback_cache = fallback_hf_cache_dir();
-                    std::fs::create_dir_all(&fallback_cache).with_context(|| {
-                        format!(
-                            "Failed to create fallback Hugging Face cache directory at {}",
-                            fallback_cache.display()
-                        )
-                    })?;
-                    let fallback_api = ApiBuilder::new()
-                        .with_cache_dir(fallback_cache.clone())
-                        .build()
-                        .with_context(|| {
-                            format!(
-                                "Failed to initialize fallback Hugging Face API with cache {}",
-                                fallback_cache.display()
-                            )
-                        })?;
-                    let fallback_cache = Cache::new(fallback_cache.clone());
-                    let fallback_cache_path = fallback_cache.path().clone();
-                    load_model_bundles(
-                        &fallback_api,
-                        &fallback_cache,
-                        runtime_backend,
-                        &mut on_progress,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "Retry with fallback Hugging Face cache failed at {}",
-                            fallback_cache_path.display()
-                        )
-                    })?
-                }
-                Err(error) => return Err(error),
-            };
+        let (runtime_backend, tr_en, en_tr) = load_model_bundles_with_runtime_fallback(
+            &api,
+            &default_cache,
+            configured_runtime.backend,
+            &mut on_progress,
+        )?;
+        let device_label = if runtime_backend == configured_runtime.backend {
+            configured_runtime.device_label
+        } else {
+            runtime_backend.label()
+        };
 
         Ok(Self {
             tr_en,
             en_tr,
             decoder_config,
+            #[cfg(target_os = "macos")]
             runtime_backend,
             device_label,
         })
@@ -344,6 +344,80 @@ where
     Ok((tr_en, en_tr))
 }
 
+fn load_model_bundles_with_cache_fallback<F>(
+    api: &Api,
+    cache: &Cache,
+    runtime_backend: RuntimeBackend,
+    on_progress: &mut F,
+) -> Result<(ModelBundle, ModelBundle)>
+where
+    F: FnMut(StartupProgress),
+{
+    match load_model_bundles(api, cache, runtime_backend, on_progress) {
+        Ok(bundles) => Ok(bundles),
+        Err(error) if is_file_exists_io_error(&error) => {
+            let fallback_cache = fallback_hf_cache_dir();
+            std::fs::create_dir_all(&fallback_cache).with_context(|| {
+                format!(
+                    "Failed to create fallback Hugging Face cache directory at {}",
+                    fallback_cache.display()
+                )
+            })?;
+            let fallback_api = ApiBuilder::new()
+                .with_cache_dir(fallback_cache.clone())
+                .build()
+                .with_context(|| {
+                    format!(
+                        "Failed to initialize fallback Hugging Face API with cache {}",
+                        fallback_cache.display()
+                    )
+                })?;
+            let fallback_cache = Cache::new(fallback_cache.clone());
+            let fallback_cache_path = fallback_cache.path().clone();
+            load_model_bundles(&fallback_api, &fallback_cache, runtime_backend, on_progress)
+                .with_context(|| {
+                    format!(
+                        "Retry with fallback Hugging Face cache failed at {}",
+                        fallback_cache_path.display()
+                    )
+                })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn load_model_bundles_with_runtime_fallback<F>(
+    api: &Api,
+    cache: &Cache,
+    preferred_backend: RuntimeBackend,
+    on_progress: &mut F,
+) -> Result<(RuntimeBackend, ModelBundle, ModelBundle)>
+where
+    F: FnMut(StartupProgress),
+{
+    let runtime_backends = runtime_backend_fallbacks(preferred_backend);
+    let mut last_error = None;
+
+    for (attempt, runtime_backend) in runtime_backends.into_iter().enumerate() {
+        if attempt > 0 {
+            on_progress(StartupProgress {
+                message: format!(
+                    "Retrying translation sessions on {}.",
+                    runtime_backend.label()
+                ),
+                progress: 0.14,
+            });
+        }
+
+        match load_model_bundles_with_cache_fallback(api, cache, runtime_backend, on_progress) {
+            Ok((tr_en, en_tr)) => return Ok((runtime_backend, tr_en, en_tr)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.expect("runtime backend fallback chain always tries at least one backend"))
+}
+
 fn is_file_exists_io_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let text = cause.to_string();
@@ -361,7 +435,7 @@ fn fallback_hf_cache_dir() -> PathBuf {
     std::env::temp_dir().join("localtranslate-hf-hub")
 }
 
-fn configure_ort() -> Result<(RuntimeBackend, String)> {
+fn configure_ort() -> Result<ConfiguredRuntime> {
     ort::init().commit();
 
     let force_cpu = std::env::var("TRANSLATE_DEVICE")
@@ -369,30 +443,60 @@ fn configure_ort() -> Result<(RuntimeBackend, String)> {
         .unwrap_or(false);
 
     if force_cpu {
-        return Ok((RuntimeBackend::Cpu, RuntimeBackend::Cpu.label()));
+        return Ok(ConfiguredRuntime::new(RuntimeBackend::Cpu));
     }
 
     #[cfg(target_os = "windows")]
     {
-        let directml =
-            DirectML::default().with_performance_preference(PerformancePreference::HighPerformance);
-        if directml.is_available().unwrap_or(false) {
-            let backend = RuntimeBackend::DirectML;
-            return Ok((backend, backend.label()));
-        }
+        Ok(select_windows_runtime_backend())
     }
 
     #[cfg(target_os = "macos")]
     {
         let settings = coreml_settings_from_env();
-        let coreml = build_coreml_execution_provider(settings);
-        if coreml.is_available().unwrap_or(false) {
-            let backend = RuntimeBackend::CoreML { settings };
-            return Ok((backend, backend.label()));
+        if probe_execution_provider(build_coreml_execution_provider(settings)).is_ok() {
+            return Ok(ConfiguredRuntime::new(RuntimeBackend::CoreML { settings }));
         }
+
+        return Ok(ConfiguredRuntime::new(RuntimeBackend::Cpu));
     }
 
-    Ok((RuntimeBackend::Cpu, RuntimeBackend::Cpu.label()))
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    Ok(ConfiguredRuntime::new(RuntimeBackend::Cpu))
+}
+
+fn runtime_backend_fallbacks(preferred_backend: RuntimeBackend) -> Vec<RuntimeBackend> {
+    let mut runtime_backends = vec![preferred_backend];
+
+    #[cfg(target_os = "windows")]
+    if preferred_backend == RuntimeBackend::Cuda {
+        runtime_backends.push(RuntimeBackend::DirectML);
+    }
+
+    if preferred_backend != RuntimeBackend::Cpu {
+        runtime_backends.push(RuntimeBackend::Cpu);
+    }
+
+    runtime_backends
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn probe_execution_provider<E>(provider: E) -> Result<()>
+where
+    E: ExecutionProvider,
+{
+    if !provider.supported_by_platform() {
+        return Err(anyhow::anyhow!(
+            "{} is not supported on this platform",
+            provider.name()
+        ));
+    }
+
+    let mut session_builder = Session::builder()?;
+
+    provider
+        .register(&mut session_builder)
+        .map_err(anyhow::Error::from)
 }
 
 fn session_builder() -> Result<SessionBuilder> {
@@ -425,12 +529,24 @@ fn build_model_sessions(
 
 fn build_model_session(model_path: &Path, runtime_backend: RuntimeBackend) -> Result<Session> {
     #[cfg(target_os = "windows")]
+    if runtime_backend == RuntimeBackend::Cuda {
+        return session_builder()?
+            .with_execution_providers([
+                build_cuda_execution_provider().build().error_on_failure(),
+                CPU::default().build(),
+            ])
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .commit_from_file(model_path)
+            .map_err(Into::into);
+    }
+
+    #[cfg(target_os = "windows")]
     if runtime_backend == RuntimeBackend::DirectML {
         return session_builder()?
             .with_execution_providers([
-                DirectML::default()
-                    .with_performance_preference(PerformancePreference::HighPerformance)
-                    .build(),
+                build_directml_execution_provider()
+                    .build()
+                    .error_on_failure(),
                 CPU::default().build(),
             ])
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -442,7 +558,9 @@ fn build_model_session(model_path: &Path, runtime_backend: RuntimeBackend) -> Re
     if let RuntimeBackend::CoreML { settings } = runtime_backend {
         return session_builder()?
             .with_execution_providers([
-                build_coreml_execution_provider(settings).build(),
+                build_coreml_execution_provider(settings)
+                    .build()
+                    .error_on_failure(),
                 CPU::default().build(),
             ])
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -459,13 +577,91 @@ fn build_model_session(model_path: &Path, runtime_backend: RuntimeBackend) -> Re
 
 #[cfg(target_os = "windows")]
 fn detect_directml_device_label() -> String {
-    directml_adapter_info()
+    preferred_windows_adapter_info()
         .map(|info| format_directml_device_label(&info))
         .unwrap_or_else(|| "DirectML (GPU)".to_owned())
 }
 
 #[cfg(target_os = "windows")]
-fn directml_adapter_info() -> Option<wgpu::AdapterInfo> {
+fn detect_cuda_device_label() -> String {
+    windows_adapter_info_for_vendor(NVIDIA_VENDOR_ID)
+        .map(|info| format_cuda_device_label(&info))
+        .unwrap_or_else(|| "CUDA (NVIDIA)".to_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn select_windows_runtime_backend() -> ConfiguredRuntime {
+    let preferred_vendor = preferred_windows_adapter_info().map(|info| info.vendor);
+    let cuda_probe = probe_execution_provider(build_cuda_execution_provider());
+    let directml_probe = probe_execution_provider(build_directml_execution_provider());
+    let cuda_usable = cuda_probe.is_ok();
+    let directml_usable = directml_probe.is_ok();
+
+    if should_prefer_cuda_for_vendor(preferred_vendor) && cuda_usable {
+        ConfiguredRuntime::new(RuntimeBackend::Cuda)
+    } else if directml_usable {
+        if should_prefer_cuda_for_vendor(preferred_vendor) && !cuda_usable {
+            eprintln!(
+                "CUDA execution provider could not be initialized; falling back to DirectML. CUDA probe error: {}",
+                cuda_probe
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "unknown error".to_owned())
+            );
+            ConfiguredRuntime {
+                backend: RuntimeBackend::DirectML,
+                device_label: annotate_device_label(
+                    detect_directml_device_label(),
+                    "CUDA unavailable",
+                ),
+            }
+        } else {
+            ConfiguredRuntime::new(RuntimeBackend::DirectML)
+        }
+    } else if cuda_usable {
+        ConfiguredRuntime::new(RuntimeBackend::Cuda)
+    } else {
+        ConfiguredRuntime::new(RuntimeBackend::Cpu)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn annotate_device_label(label: String, note: &str) -> String {
+    format!("{label} [{note}]")
+}
+
+#[cfg(target_os = "windows")]
+fn should_prefer_cuda_for_vendor(vendor_id: Option<u32>) -> bool {
+    vendor_id.is_none() || vendor_id == Some(NVIDIA_VENDOR_ID)
+}
+
+#[cfg(target_os = "windows")]
+fn build_cuda_execution_provider() -> CUDA {
+    CUDA::default()
+}
+
+#[cfg(target_os = "windows")]
+fn build_directml_execution_provider() -> DirectML {
+    DirectML::default().with_performance_preference(PerformancePreference::HighPerformance)
+}
+
+#[cfg(target_os = "windows")]
+fn preferred_windows_adapter_info() -> Option<wgpu::AdapterInfo> {
+    windows_adapter_infos()
+        .into_iter()
+        .max_by_key(score_adapter_for_directml)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_adapter_info_for_vendor(vendor_id: u32) -> Option<wgpu::AdapterInfo> {
+    windows_adapter_infos()
+        .into_iter()
+        .filter(|info| info.vendor == vendor_id)
+        .max_by_key(score_adapter_for_directml)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_adapter_infos() -> Vec<wgpu::AdapterInfo> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::DX12,
         ..Default::default()
@@ -476,11 +672,11 @@ fn directml_adapter_info() -> Option<wgpu::AdapterInfo> {
         .into_iter()
         .map(|adapter| adapter.get_info())
         .filter(|info| info.device_type != wgpu::DeviceType::Cpu)
-        .max_by_key(score_adapter_for_directml)
+        .collect()
 }
 
 #[cfg(target_os = "windows")]
-fn score_adapter_for_directml(info: &wgpu::AdapterInfo) -> (u8, u8) {
+fn score_adapter_for_directml(info: &wgpu::AdapterInfo) -> (u8, u8, u8) {
     let device_priority = match info.device_type {
         wgpu::DeviceType::DiscreteGpu => 5,
         wgpu::DeviceType::IntegratedGpu => 4,
@@ -489,8 +685,15 @@ fn score_adapter_for_directml(info: &wgpu::AdapterInfo) -> (u8, u8) {
         wgpu::DeviceType::Cpu => 1,
     };
     let preferred_vendor = u8::from(!is_software_or_microsoft_adapter(info));
+    let vendor_priority = match info.vendor {
+        NVIDIA_VENDOR_ID => 4,
+        AMD_VENDOR_ID | AMD_CPU_VENDOR_ID => 3,
+        INTEL_VENDOR_ID => 2,
+        QUALCOMM_VENDOR_ID => 1,
+        _ => 0,
+    };
 
-    (device_priority, preferred_vendor)
+    (device_priority, preferred_vendor, vendor_priority)
 }
 
 #[cfg(target_os = "windows")]
@@ -500,13 +703,23 @@ fn is_software_or_microsoft_adapter(info: &wgpu::AdapterInfo) -> bool {
 
 #[cfg(target_os = "windows")]
 fn format_directml_device_label(info: &wgpu::AdapterInfo) -> String {
+    format_gpu_provider_label("DirectML", info)
+}
+
+#[cfg(target_os = "windows")]
+fn format_cuda_device_label(info: &wgpu::AdapterInfo) -> String {
+    format_gpu_provider_label("CUDA", info)
+}
+
+#[cfg(target_os = "windows")]
+fn format_gpu_provider_label(provider_name: &str, info: &wgpu::AdapterInfo) -> String {
     let adapter_name = info.name.trim();
     if !adapter_name.is_empty() {
-        return format!("DirectML ({adapter_name})");
+        return format!("{provider_name} ({adapter_name})");
     }
 
     let vendor_name = gpu_vendor_name(info.vendor);
-    format!("DirectML ({vendor_name})")
+    format!("{provider_name} ({vendor_name})")
 }
 
 #[cfg(target_os = "windows")]
@@ -696,6 +909,7 @@ fn summarize_f32_shape(name: &str, shape: &[usize]) -> String {
     format!("{name}=f32{:?}", shape)
 }
 
+#[cfg(target_os = "macos")]
 fn log_session_io(label: &str, session: &Session) {
     eprintln!("CoreML debug: session `{label}` inputs:");
     for input in session.inputs() {
@@ -757,7 +971,9 @@ where
     Ok(ModelBundle {
         encoder,
         decoder,
+        #[cfg(target_os = "macos")]
         encoder_path,
+        #[cfg(target_os = "macos")]
         decoder_path,
         source_tokenizer,
         target_tokenizer,
@@ -1600,12 +1816,13 @@ enum LayoutSegment {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecoderConfig, TranslationLayout, parse_env_bool, parse_env_usize};
     #[cfg(target_os = "windows")]
     use super::{
-        MICROSOFT_VENDOR_ID, NVIDIA_VENDOR_ID, format_directml_device_label,
-        score_adapter_for_directml,
+        AMD_VENDOR_ID, MICROSOFT_VENDOR_ID, NVIDIA_VENDOR_ID, annotate_device_label,
+        format_cuda_device_label, format_directml_device_label, score_adapter_for_directml,
+        should_prefer_cuda_for_vendor,
     };
+    use super::{DecoderConfig, TranslationLayout, parse_env_bool, parse_env_usize};
     #[cfg(target_os = "macos")]
     use super::{
         format_coreml_device_label, parse_coreml_compute_units, parse_coreml_model_format,
@@ -1726,6 +1943,41 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn uses_adapter_name_for_cuda_label() {
+        let info = adapter_info(
+            "NVIDIA GeForce RTX 4070 SUPER",
+            NVIDIA_VENDOR_ID,
+            wgpu::DeviceType::DiscreteGpu,
+        );
+
+        assert_eq!(
+            format_cuda_device_label(&info),
+            "CUDA (NVIDIA GeForce RTX 4070 SUPER)"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn appends_runtime_note_to_device_label() {
+        assert_eq!(
+            annotate_device_label(
+                "DirectML (NVIDIA GeForce RTX 2050)".into(),
+                "CUDA unavailable"
+            ),
+            "DirectML (NVIDIA GeForce RTX 2050) [CUDA unavailable]"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cuda_vendor_preference_only_targets_nvidia_or_unknown() {
+        assert!(should_prefer_cuda_for_vendor(Some(NVIDIA_VENDOR_ID)));
+        assert!(should_prefer_cuda_for_vendor(None));
+        assert!(!should_prefer_cuda_for_vendor(Some(AMD_VENDOR_ID)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn prefers_hardware_gpu_over_microsoft_software_adapter() {
         let discrete_gpu = adapter_info(
             "NVIDIA GeForce RTX 4070 SUPER",
@@ -1742,5 +1994,22 @@ mod tests {
             score_adapter_for_directml(&discrete_gpu)
                 > score_adapter_for_directml(&software_adapter)
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prefers_nvidia_over_equivalent_amd_adapter() {
+        let nvidia_gpu = adapter_info(
+            "NVIDIA GeForce RTX 4070 SUPER",
+            NVIDIA_VENDOR_ID,
+            wgpu::DeviceType::DiscreteGpu,
+        );
+        let amd_gpu = adapter_info(
+            "Radeon RX 7800 XT",
+            AMD_VENDOR_ID,
+            wgpu::DeviceType::DiscreteGpu,
+        );
+
+        assert!(score_adapter_for_directml(&nvidia_gpu) > score_adapter_for_directml(&amd_gpu));
     }
 }
