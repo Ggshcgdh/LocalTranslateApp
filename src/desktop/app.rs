@@ -17,6 +17,7 @@ pub struct TranslateDesktopApp {
     is_translating: bool,
     startup_started_at: Instant,
     translation_started_at: Option<Instant>,
+    last_translation_duration: Option<Duration>,
     status: WorkerStatus,
     last_error: Option<String>,
     startup_progress: Option<StartupProgress>,
@@ -34,6 +35,7 @@ impl TranslateDesktopApp {
             is_translating: false,
             startup_started_at: Instant::now(),
             translation_started_at: None,
+            last_translation_duration: None,
             status: WorkerStatus::Loading,
             last_error: None,
             startup_progress: None,
@@ -60,6 +62,8 @@ impl TranslateDesktopApp {
                 }
                 Ok(WorkerEvent::TranslationCompleted(result)) => {
                     self.is_translating = false;
+                    self.last_translation_duration =
+                        self.translation_started_at.map(|s| s.elapsed());
                     self.translation_started_at = None;
                     match result {
                         Ok(text) => {
@@ -67,6 +71,7 @@ impl TranslateDesktopApp {
                             self.last_error = None;
                         }
                         Err(error) => {
+                            self.last_translation_duration = None;
                             self.last_error = Some(error);
                         }
                     }
@@ -104,6 +109,7 @@ impl TranslateDesktopApp {
         self.direction = direction;
         self.translated_text.clear();
         self.last_error = None;
+        self.last_translation_duration = None;
     }
 
     fn submit_translation(&mut self) {
@@ -113,6 +119,7 @@ impl TranslateDesktopApp {
 
         self.is_translating = true;
         self.translation_started_at = Some(Instant::now());
+        self.last_translation_duration = None;
         self.last_error = None;
         self.translated_text.clear();
 
@@ -435,8 +442,14 @@ impl TranslateDesktopApp {
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
+                    let char_count = self.source_text.len();
+                    let char_label = if char_count == 1 {
+                        "1 character".to_owned()
+                    } else {
+                        format!("{char_count} characters")
+                    };
                     ui.label(
-                        RichText::new("Large documents stay contained inside this editor.")
+                        RichText::new(char_label)
                             .small()
                             .color(text_muted_color()),
                     );
@@ -463,6 +476,16 @@ impl TranslateDesktopApp {
                             .color(text_muted_color()),
                     );
                 });
+
+                if let Some(duration) = self.last_translation_duration {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(format!("⏱ Completed in {}", format_duration_human(duration)))
+                            .small()
+                            .color(Color32::from_rgb(34, 92, 57)),
+                    );
+                }
+
                 ui.add_space(10.0);
 
                 let editor_height = panel_editor_height(ui);
@@ -852,6 +875,24 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
+fn format_duration_human(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    let millis = duration.subsec_millis();
+
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else if seconds > 0 {
+        format!("{seconds}.{:01}s", millis / 100)
+    } else {
+        format!("{}ms", millis)
+    }
+}
+
 fn available_or(value: f32, fallback: f32) -> f32 {
     if value.is_finite() && value > 0.0 {
         value
@@ -969,7 +1010,8 @@ mod tests {
 
     use super::{
         TranslateDesktopApp, TranslationDirection, WorkerHandle, WorkerStatus, available_or,
-        format_elapsed, panel_content_height, scroll_editor_viewport_height,
+        format_duration_human, format_elapsed, panel_content_height,
+        scroll_editor_viewport_height,
     };
     use crate::translate::TargetLang;
 
@@ -1001,6 +1043,7 @@ mod tests {
             is_translating: false,
             startup_started_at: Instant::now(),
             translation_started_at: None,
+            last_translation_duration: Some(Duration::from_secs(42)),
             status: WorkerStatus::Ready {
                 device_label: "CPU".into(),
             },
@@ -1017,6 +1060,7 @@ mod tests {
         assert_eq!(app.source_text, "Hello world");
         assert!(app.translated_text.is_empty());
         assert!(app.last_error.is_none());
+        assert!(app.last_translation_duration.is_none());
     }
 
     #[test]
@@ -1035,5 +1079,37 @@ mod tests {
     fn scroll_editor_viewport_height_accounts_for_frame_padding() {
         assert_eq!(scroll_editor_viewport_height(420.0), 398.0);
         assert_eq!(scroll_editor_viewport_height(18.0), 0.0);
+    }
+
+    #[test]
+    fn formats_duration_human_hours() {
+        assert_eq!(
+            format_duration_human(Duration::from_secs(3661)),
+            "1h 1m 1s"
+        );
+    }
+
+    #[test]
+    fn formats_duration_human_minutes() {
+        assert_eq!(
+            format_duration_human(Duration::from_secs(135)),
+            "2m 15s"
+        );
+    }
+
+    #[test]
+    fn formats_duration_human_seconds() {
+        assert_eq!(
+            format_duration_human(Duration::from_millis(3400)),
+            "3.4s"
+        );
+    }
+
+    #[test]
+    fn formats_duration_human_millis() {
+        assert_eq!(
+            format_duration_human(Duration::from_millis(780)),
+            "780ms"
+        );
     }
 }
