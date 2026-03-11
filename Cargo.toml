@@ -18,6 +18,8 @@ wgpu = "=27.0.1"
 [target.'cfg(target_os = "windows")'.dependencies]
 # ONNX Runtime: Windows'ta CUDA (NVIDIA) + DirectML (AMD/Intel) GPU desteği
 ort = { version = "=2.0.0-rc.12", features = ["cuda", "directml", "copy-dylibs", "download-binaries", "ndarray"] }
+# CUDA runtime DLL varlık kontrolü için Windows API
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # ONNX Runtime: macOS'ta CoreML ile Apple GPU / Neural Engine hızlandırması

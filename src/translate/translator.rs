@@ -411,7 +411,14 @@ where
 
         match load_model_bundles_with_cache_fallback(api, cache, runtime_backend, on_progress) {
             Ok((tr_en, en_tr)) => return Ok((runtime_backend, tr_en, en_tr)),
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                eprintln!(
+                    "[LocalTranslate] {} session failed: {:#}",
+                    runtime_backend.label(),
+                    error
+                );
+                last_error = Some(error);
+            }
         }
     }
 
@@ -592,42 +599,69 @@ fn detect_cuda_device_label() -> String {
 #[cfg(target_os = "windows")]
 fn select_windows_runtime_backend() -> ConfiguredRuntime {
     let preferred_vendor = preferred_windows_adapter_info().map(|info| info.vendor);
-    let cuda_probe = probe_execution_provider(build_cuda_execution_provider());
-    let directml_probe = probe_execution_provider(build_directml_execution_provider());
-    let cuda_usable = cuda_probe.is_ok();
-    let directml_usable = directml_probe.is_ok();
 
-    if should_prefer_cuda_for_vendor(preferred_vendor) && cuda_usable {
-        ConfiguredRuntime::new(RuntimeBackend::Cuda)
-    } else if directml_usable {
-        if should_prefer_cuda_for_vendor(preferred_vendor) && !cuda_usable {
-            eprintln!(
-                "CUDA execution provider could not be initialized; falling back to DirectML. CUDA probe error: {}",
-                cuda_probe
-                    .err()
-                    .map(|error| error.to_string())
-                    .unwrap_or_else(|| "unknown error".to_owned())
-            );
-            ConfiguredRuntime {
-                backend: RuntimeBackend::DirectML,
-                device_label: annotate_device_label(
-                    detect_directml_device_label(),
-                    "CUDA unavailable",
-                ),
-            }
-        } else {
-            ConfiguredRuntime::new(RuntimeBackend::DirectML)
+    // NVIDIA kartlarda CUDA tercih edilir; önce gerçek CUDA kullanılabilirliği kontrol edilir.
+    // EP probe'u yetersiz: onnxruntime_providers_cuda.dll mevcut olduğunda probe başarılı olur
+    // ama asıl CUDA runtime kütüphaneleri (cudart, cublas, cudnn) eksik olabilir.
+    if should_prefer_cuda_for_vendor(preferred_vendor) {
+        if is_cuda_runtime_available() {
+            return ConfiguredRuntime::new(RuntimeBackend::Cuda);
         }
-    } else if cuda_usable {
-        ConfiguredRuntime::new(RuntimeBackend::Cuda)
-    } else {
-        ConfiguredRuntime::new(RuntimeBackend::Cpu)
     }
+
+    if probe_execution_provider(build_directml_execution_provider()).is_ok() {
+        return ConfiguredRuntime::new(RuntimeBackend::DirectML);
+    }
+
+    ConfiguredRuntime::new(RuntimeBackend::Cpu)
+}
+
+/// CUDA Toolkit'in gerçekten kurulu olup olmadığını kontrol eder.
+///
+/// `nvcuda.dll` (NVIDIA driver ile gelir) ve `cudart64_12.dll` (CUDA Toolkit ile gelir)
+/// DLL'lerinin yüklenebilir durumda olup olmadığını test eder. Her iki DLL de bulunmalıdır.
+#[cfg(target_os = "windows")]
+fn is_cuda_runtime_available() -> bool {
+    // nvcuda.dll: NVIDIA driver tarafından sağlanır, tüm NVIDIA kartlarda bulunur.
+    // cudart64_12.dll: CUDA Toolkit 12.x ile birlikte gelir, toolkit kurulmadığında yoktur.
+    for dll_name in &["nvcuda.dll", "cudart64_12.dll"] {
+        if !can_load_library(dll_name) {
+            log_cuda_unavailable(dll_name);
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(target_os = "windows")]
-fn annotate_device_label(label: String, note: &str) -> String {
-    format!("{label} [{note}]")
+fn can_load_library(name: &str) -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = OsStr::new(name).encode_wide().chain(std::iter::once(0)).collect();
+
+    // SAFETY: LoadLibraryW is a well-defined Windows API.
+    // Handle is intentionally leaked — this runs once at startup.
+    let handle =
+        unsafe { windows_sys::Win32::System::LibraryLoader::LoadLibraryW(wide.as_ptr()) };
+    !handle.is_null()
+}
+
+#[cfg(target_os = "windows")]
+fn log_cuda_unavailable(missing_dll: &str) {
+    let message = format!(
+        "[LocalTranslate] CUDA is not available: {missing_dll} could not be loaded. \
+         Install CUDA Toolkit 12.x and cuDNN 9.x to enable CUDA acceleration. \
+         Falling back to DirectML."
+    );
+    eprintln!("{message}");
+
+    // windows_subsystem = "windows" olduğu için stderr GUI modunda görünmez;
+    // teşhis bilgisini exe'nin yanındaki cuda_error.log dosyasına da yaz.
+    if let Ok(exe_path) = std::env::current_exe() {
+        let log_path = exe_path.with_file_name("cuda_error.log");
+        let _ = std::fs::write(&log_path, &message);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1818,9 +1852,8 @@ enum LayoutSegment {
 mod tests {
     #[cfg(target_os = "windows")]
     use super::{
-        AMD_VENDOR_ID, MICROSOFT_VENDOR_ID, NVIDIA_VENDOR_ID, annotate_device_label,
-        format_cuda_device_label, format_directml_device_label, score_adapter_for_directml,
-        should_prefer_cuda_for_vendor,
+        AMD_VENDOR_ID, MICROSOFT_VENDOR_ID, NVIDIA_VENDOR_ID, format_cuda_device_label,
+        format_directml_device_label, score_adapter_for_directml, should_prefer_cuda_for_vendor,
     };
     use super::{DecoderConfig, TranslationLayout, parse_env_bool, parse_env_usize};
     #[cfg(target_os = "macos")]
@@ -1953,18 +1986,6 @@ mod tests {
         assert_eq!(
             format_cuda_device_label(&info),
             "CUDA (NVIDIA GeForce RTX 4070 SUPER)"
-        );
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn appends_runtime_note_to_device_label() {
-        assert_eq!(
-            annotate_device_label(
-                "DirectML (NVIDIA GeForce RTX 2050)".into(),
-                "CUDA unavailable"
-            ),
-            "DirectML (NVIDIA GeForce RTX 2050) [CUDA unavailable]"
         );
     }
 

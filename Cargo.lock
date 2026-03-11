@@ -15,6 +15,7 @@ dependencies = [
  "serde_json",
  "tokenizers",
  "wgpu",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
