@@ -7,8 +7,8 @@ use eframe::egui::{
     ScrollArea, Sense, Stroke, TextEdit, Vec2,
 };
 
-use crate::translate::{TargetLang, Translator};
 use crate::translate::StartupProgress;
+use crate::translate::{TargetLang, Translator};
 
 pub struct TranslateDesktopApp {
     source_text: String,
@@ -51,6 +51,9 @@ impl TranslateDesktopApp {
                         message: "Runtime is ready.".to_owned(),
                         progress: 1.0,
                     });
+                }
+                Ok(WorkerEvent::RuntimeChanged { device_label }) => {
+                    self.status = WorkerStatus::Ready { device_label };
                 }
                 Ok(WorkerEvent::StartupProgress(progress)) => {
                     self.startup_progress = Some(progress);
@@ -164,7 +167,7 @@ impl TranslateDesktopApp {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
-                    "Set TRANSLATE_DEVICE=cpu to force CPU execution. AMD, NVIDIA, and Intel GPUs are detected through DirectML when available.",
+                    "Set TRANSLATE_DEVICE=cpu to force CPU execution. Windows uses DirectML when available; macOS uses CoreML, and TRANSLATE_COREML_UNITS=all|ane|gpu|cpu can tune the Apple backend.",
                 )
                 .small()
                 .color(text_muted_color()),
@@ -717,6 +720,7 @@ enum WorkerCommand {
 enum WorkerEvent {
     StartupProgress(StartupProgress),
     Ready { device_label: String },
+    RuntimeChanged { device_label: String },
     TranslationCompleted(Result<String, String>),
     StartupFailed(String),
 }
@@ -749,9 +753,16 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
     while let Ok(command) = commands.recv() {
         match command {
             WorkerCommand::Translate { text, target } => {
+                let previous_device_label = translator.device_label().to_owned();
                 let result = translator
                     .translate(&text, target)
                     .map_err(|error| format!("{error:#}"));
+
+                if translator.device_label() != previous_device_label {
+                    let _ = events.send(WorkerEvent::RuntimeChanged {
+                        device_label: translator.device_label().to_owned(),
+                    });
+                }
 
                 if events
                     .send(WorkerEvent::TranslationCompleted(result))

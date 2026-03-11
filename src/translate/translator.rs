@@ -6,15 +6,22 @@ use hf_hub::api::Progress;
 use hf_hub::api::sync::{Api, ApiBuilder};
 use hf_hub::{Cache, Repo};
 use ndarray::{Array2, Array3, ArrayView1, ArrayView3, Axis, Ix3};
+use ort::ep::CPU;
+#[cfg(target_os = "macos")]
+use ort::ep::CoreML;
 #[cfg(target_os = "windows")]
+use ort::ep::DirectML;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use ort::ep::ExecutionProvider;
+#[cfg(target_os = "macos")]
+use ort::ep::coreml::{
+    ComputeUnits as CoreMLComputeUnits, ModelFormat as CoreMLModelFormat,
+    SpecializationStrategy as CoreMLSpecializationStrategy,
+};
 #[cfg(target_os = "windows")]
 use ort::ep::directml::PerformancePreference;
-use ort::execution_providers::CPUExecutionProvider;
-#[cfg(target_os = "windows")]
-use ort::execution_providers::DirectMLExecutionProvider;
 use ort::session::Session;
-use ort::session::builder::GraphOptimizationLevel;
+use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::value::TensorRef;
 use prost::Message;
 use serde_json::Value;
@@ -54,10 +61,23 @@ pub enum TargetLang {
 struct ModelBundle {
     encoder: Session,
     decoder: Session,
+    encoder_path: PathBuf,
+    decoder_path: PathBuf,
     source_tokenizer: Tokenizer,
     target_tokenizer: Tokenizer,
     pad_token_id: i64,
     eos_token_id: i64,
+}
+
+impl ModelBundle {
+    fn build_sessions(&self, runtime_backend: RuntimeBackend) -> Result<(Session, Session)> {
+        build_model_sessions(&self.encoder_path, &self.decoder_path, runtime_backend)
+    }
+
+    fn replace_sessions(&mut self, encoder: Session, decoder: Session) {
+        self.encoder = encoder;
+        self.decoder = decoder;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +85,39 @@ struct DecoderConfig {
     max_input_tokens: usize,
     max_new_tokens: usize,
     num_beams: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CoreMLSettings {
+    compute_units: CoreMLComputeUnits,
+    model_format: CoreMLModelFormat,
+    static_input_shapes: bool,
+    profile_compute_plan: bool,
+    enable_cache: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeBackend {
+    Cpu,
+    #[cfg(target_os = "windows")]
+    DirectML,
+    #[cfg(target_os = "macos")]
+    CoreML {
+        settings: CoreMLSettings,
+    },
+}
+
+impl RuntimeBackend {
+    fn label(self) -> String {
+        match self {
+            Self::Cpu => "CPU".to_owned(),
+            #[cfg(target_os = "windows")]
+            Self::DirectML => detect_directml_device_label(),
+            #[cfg(target_os = "macos")]
+            Self::CoreML { settings } => format_coreml_device_label(settings.compute_units),
+        }
+    }
 }
 
 impl Default for DecoderConfig {
@@ -101,6 +154,7 @@ pub struct Translator {
     tr_en: ModelBundle,
     en_tr: ModelBundle,
     decoder_config: DecoderConfig,
+    runtime_backend: RuntimeBackend,
     device_label: String,
 }
 
@@ -120,7 +174,7 @@ impl Translator {
             progress: 0.03,
         });
 
-        let device_label =
+        let (runtime_backend, device_label) =
             configure_ort().context("Failed to initialize ONNX Runtime execution providers")?;
         let decoder_config = DecoderConfig::from_env();
 
@@ -133,43 +187,49 @@ impl Translator {
         let api = ApiBuilder::from_cache(default_cache.clone())
             .build()
             .context("Failed to initialize Hugging Face Hub API client")?;
-        let (tr_en, en_tr) = match load_model_bundles(&api, &default_cache, &mut on_progress) {
-            Ok(bundles) => bundles,
-            Err(error) if is_file_exists_io_error(&error) => {
-                let fallback_cache = fallback_hf_cache_dir();
-                std::fs::create_dir_all(&fallback_cache).with_context(|| {
-                    format!(
-                        "Failed to create fallback Hugging Face cache directory at {}",
-                        fallback_cache.display()
-                    )
-                })?;
-                let fallback_api = ApiBuilder::new()
-                    .with_cache_dir(fallback_cache.clone())
-                    .build()
-                    .with_context(|| {
+        let (tr_en, en_tr) =
+            match load_model_bundles(&api, &default_cache, runtime_backend, &mut on_progress) {
+                Ok(bundles) => bundles,
+                Err(error) if is_file_exists_io_error(&error) => {
+                    let fallback_cache = fallback_hf_cache_dir();
+                    std::fs::create_dir_all(&fallback_cache).with_context(|| {
                         format!(
-                            "Failed to initialize fallback Hugging Face API with cache {}",
+                            "Failed to create fallback Hugging Face cache directory at {}",
                             fallback_cache.display()
                         )
                     })?;
-                let fallback_cache = Cache::new(fallback_cache.clone());
-                let fallback_cache_path = fallback_cache.path().clone();
-                load_model_bundles(&fallback_api, &fallback_cache, &mut on_progress).with_context(
-                    || {
+                    let fallback_api = ApiBuilder::new()
+                        .with_cache_dir(fallback_cache.clone())
+                        .build()
+                        .with_context(|| {
+                            format!(
+                                "Failed to initialize fallback Hugging Face API with cache {}",
+                                fallback_cache.display()
+                            )
+                        })?;
+                    let fallback_cache = Cache::new(fallback_cache.clone());
+                    let fallback_cache_path = fallback_cache.path().clone();
+                    load_model_bundles(
+                        &fallback_api,
+                        &fallback_cache,
+                        runtime_backend,
+                        &mut on_progress,
+                    )
+                    .with_context(|| {
                         format!(
                             "Retry with fallback Hugging Face cache failed at {}",
                             fallback_cache_path.display()
                         )
-                    },
-                )?
-            }
-            Err(error) => return Err(error),
-        };
+                    })?
+                }
+                Err(error) => return Err(error),
+            };
 
         Ok(Self {
             tr_en,
             en_tr,
             decoder_config,
+            runtime_backend,
             device_label,
         })
     }
@@ -184,16 +244,19 @@ impl Translator {
             return Ok(text.to_owned());
         }
 
-        let model = match target {
-            TargetLang::En => &mut self.tr_en,
-            TargetLang::Tr => &mut self.en_tr,
+        let translated = match self.translate_layout(&layout, target) {
+            Ok(translated) => translated,
+            #[cfg(target_os = "macos")]
+            Err(error) if self.should_fallback_to_cpu(&error) => {
+                eprintln!("CoreML execution failed; rebuilding sessions on CPU: {error:#}");
+                self.fallback_to_cpu().context(
+                    "Failed to rebuild translation sessions on CPU after a CoreML runtime error",
+                )?;
+                self.translate_layout(&layout, target)
+                    .context("CoreML execution failed, and the CPU retry also failed")?
+            }
+            Err(error) => return Err(error),
         };
-
-        let translated: Vec<String> = layout
-            .translatable_segments
-            .iter()
-            .map(|segment| translate_segment(model, self.decoder_config, segment))
-            .collect::<Result<_>>()?;
 
         Ok(layout.rebuild(translated))
     }
@@ -201,21 +264,82 @@ impl Translator {
     pub fn device_label(&self) -> &str {
         &self.device_label
     }
+
+    fn translate_layout(
+        &mut self,
+        layout: &TranslationLayout,
+        target: TargetLang,
+    ) -> Result<Vec<String>> {
+        let model = match target {
+            TargetLang::En => &mut self.tr_en,
+            TargetLang::Tr => &mut self.en_tr,
+        };
+
+        layout
+            .translatable_segments
+            .iter()
+            .map(|segment| translate_segment(model, self.decoder_config, segment))
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn should_fallback_to_cpu(&self, error: &anyhow::Error) -> bool {
+        matches!(self.runtime_backend, RuntimeBackend::CoreML { .. })
+            && is_coreml_runtime_error(error)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fallback_to_cpu(&mut self) -> Result<()> {
+        if self.runtime_backend == RuntimeBackend::Cpu {
+            return Ok(());
+        }
+
+        let (tr_en_encoder, tr_en_decoder) = self
+            .tr_en
+            .build_sessions(RuntimeBackend::Cpu)
+            .context("Failed to rebuild Turkish -> English sessions on CPU")?;
+        let (en_tr_encoder, en_tr_decoder) = self
+            .en_tr
+            .build_sessions(RuntimeBackend::Cpu)
+            .context("Failed to rebuild English -> Turkish sessions on CPU")?;
+
+        self.tr_en.replace_sessions(tr_en_encoder, tr_en_decoder);
+        self.en_tr.replace_sessions(en_tr_encoder, en_tr_decoder);
+        self.runtime_backend = RuntimeBackend::Cpu;
+        self.device_label = RuntimeBackend::Cpu.label();
+
+        Ok(())
+    }
 }
 
 fn load_model_bundles<F>(
     api: &Api,
     cache: &Cache,
+    runtime_backend: RuntimeBackend,
     on_progress: &mut F,
 ) -> Result<(ModelBundle, ModelBundle)>
 where
     F: FnMut(StartupProgress),
 {
     let mut tracker = ModelLoadProgressTracker::new(on_progress, 12);
-    let tr_en = load_model_pair(api, cache, TR_EN_ONNX_REPO_ID, TR_EN_BASE_REPO_ID, &mut tracker)
-        .with_context(|| format!("Failed loading model pair {TR_EN_ONNX_REPO_ID}"))?;
-    let en_tr = load_model_pair(api, cache, EN_TR_ONNX_REPO_ID, EN_TR_BASE_REPO_ID, &mut tracker)
-        .with_context(|| format!("Failed loading model pair {EN_TR_ONNX_REPO_ID}"))?;
+    let tr_en = load_model_pair(
+        api,
+        cache,
+        TR_EN_ONNX_REPO_ID,
+        TR_EN_BASE_REPO_ID,
+        runtime_backend,
+        &mut tracker,
+    )
+    .with_context(|| format!("Failed loading model pair {TR_EN_ONNX_REPO_ID}"))?;
+    let en_tr = load_model_pair(
+        api,
+        cache,
+        EN_TR_ONNX_REPO_ID,
+        EN_TR_BASE_REPO_ID,
+        runtime_backend,
+        &mut tracker,
+    )
+    .with_context(|| format!("Failed loading model pair {EN_TR_ONNX_REPO_ID}"))?;
     tracker.finish();
     Ok((tr_en, en_tr))
 }
@@ -237,42 +361,100 @@ fn fallback_hf_cache_dir() -> PathBuf {
     std::env::temp_dir().join("localtranslate-hf-hub")
 }
 
-fn configure_ort() -> Result<String> {
+fn configure_ort() -> Result<(RuntimeBackend, String)> {
+    ort::init().commit();
+
     let force_cpu = std::env::var("TRANSLATE_DEVICE")
         .map(|value| value.trim().eq_ignore_ascii_case("cpu"))
         .unwrap_or(false);
 
     if force_cpu {
-        ort::init()
-            .with_execution_providers([CPUExecutionProvider::default().build()])
-            .commit();
-        return Ok("CPU".to_owned());
+        return Ok((RuntimeBackend::Cpu, RuntimeBackend::Cpu.label()));
     }
 
     #[cfg(target_os = "windows")]
     {
-        let directml = DirectMLExecutionProvider::default()
-            .with_performance_preference(PerformancePreference::HighPerformance);
-        let use_directml = directml.is_available().unwrap_or(false);
-
-        ort::init()
-            .with_execution_providers([directml.build(), CPUExecutionProvider::default().build()])
-            .commit();
-
-        return if use_directml {
-            Ok(detect_directml_device_label())
-        } else {
-            Ok("CPU".to_owned())
-        };
+        let directml =
+            DirectML::default().with_performance_preference(PerformancePreference::HighPerformance);
+        if directml.is_available().unwrap_or(false) {
+            let backend = RuntimeBackend::DirectML;
+            return Ok((backend, backend.label()));
+        }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        ort::init()
-            .with_execution_providers([CPUExecutionProvider::default().build()])
-            .commit();
-        Ok("CPU".to_owned())
+        let settings = coreml_settings_from_env();
+        let coreml = build_coreml_execution_provider(settings);
+        if coreml.is_available().unwrap_or(false) {
+            let backend = RuntimeBackend::CoreML { settings };
+            return Ok((backend, backend.label()));
+        }
     }
+
+    Ok((RuntimeBackend::Cpu, RuntimeBackend::Cpu.label()))
+}
+
+fn session_builder() -> Result<SessionBuilder> {
+    Session::builder()?
+        .with_optimization_level(GraphOptimizationLevel::All)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .with_parallel_execution(true)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn build_model_sessions(
+    encoder_path: &Path,
+    decoder_path: &Path,
+    runtime_backend: RuntimeBackend,
+) -> Result<(Session, Session)> {
+    let encoder = build_model_session(encoder_path, runtime_backend).with_context(|| {
+        format!(
+            "Failed to create encoder session from {}",
+            encoder_path.display()
+        )
+    })?;
+    let decoder = build_model_session(decoder_path, runtime_backend).with_context(|| {
+        format!(
+            "Failed to create decoder session from {}",
+            decoder_path.display()
+        )
+    })?;
+    Ok((encoder, decoder))
+}
+
+fn build_model_session(model_path: &Path, runtime_backend: RuntimeBackend) -> Result<Session> {
+    #[cfg(target_os = "windows")]
+    if runtime_backend == RuntimeBackend::DirectML {
+        return session_builder()?
+            .with_execution_providers([
+                DirectML::default()
+                    .with_performance_preference(PerformancePreference::HighPerformance)
+                    .build(),
+                CPU::default().build(),
+            ])
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .commit_from_file(model_path)
+            .map_err(Into::into);
+    }
+
+    #[cfg(target_os = "macos")]
+    if let RuntimeBackend::CoreML { settings } = runtime_backend {
+        return session_builder()?
+            .with_execution_providers([
+                build_coreml_execution_provider(settings).build(),
+                CPU::default().build(),
+            ])
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .commit_from_file(model_path)
+            .map_err(Into::into);
+    }
+
+    session_builder()?
+        .with_execution_providers([CPU::default().build()])
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .commit_from_file(model_path)
+        .map_err(Into::into)
 }
 
 #[cfg(target_os = "windows")]
@@ -339,6 +521,163 @@ fn gpu_vendor_name(vendor_id: u32) -> &'static str {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn build_coreml_execution_provider(settings: CoreMLSettings) -> CoreML {
+    let mut coreml = CoreML::default()
+        .with_compute_units(settings.compute_units)
+        .with_model_format(settings.model_format)
+        .with_static_input_shapes(settings.static_input_shapes)
+        .with_profile_compute_plan(settings.profile_compute_plan)
+        .with_specialization_strategy(CoreMLSpecializationStrategy::FastPrediction);
+    if settings.enable_cache
+        && let Some(cache_dir) = coreml_model_cache_dir(settings)
+    {
+        coreml = coreml.with_model_cache_dir(cache_dir.display().to_string());
+    }
+    coreml
+}
+
+#[cfg(target_os = "macos")]
+fn coreml_settings_from_env() -> CoreMLSettings {
+    CoreMLSettings {
+        compute_units: coreml_compute_units_from_env(),
+        model_format: coreml_model_format_from_env(),
+        static_input_shapes: parse_env_bool("TRANSLATE_COREML_STATIC_INPUT_SHAPES", false),
+        profile_compute_plan: parse_env_bool("TRANSLATE_COREML_PROFILE_PLAN", false),
+        enable_cache: parse_env_bool("TRANSLATE_COREML_CACHE", true),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn coreml_compute_units_from_env() -> CoreMLComputeUnits {
+    let requested = std::env::var("TRANSLATE_COREML_UNITS").ok();
+    parse_coreml_compute_units(requested.as_deref())
+}
+
+#[cfg(target_os = "macos")]
+fn coreml_model_format_from_env() -> CoreMLModelFormat {
+    let requested = std::env::var("TRANSLATE_COREML_FORMAT").ok();
+    parse_coreml_model_format(requested.as_deref())
+}
+
+#[cfg(target_os = "macos")]
+fn parse_coreml_compute_units(raw: Option<&str>) -> CoreMLComputeUnits {
+    match raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("ane")
+        | Some("neural")
+        | Some("neural-engine")
+        | Some("neural_engine")
+        | Some("cpuandneuralengine")
+        | Some("cpu-neural-engine")
+        | Some("cpu_and_neural_engine") => CoreMLComputeUnits::CPUAndNeuralEngine,
+        Some("gpu") | Some("cpuandgpu") | Some("cpu-gpu") | Some("cpu_and_gpu") => {
+            CoreMLComputeUnits::CPUAndGPU
+        }
+        Some("cpu") | Some("cpuonly") | Some("cpu-only") | Some("cpu_only") => {
+            CoreMLComputeUnits::CPUOnly
+        }
+        _ => CoreMLComputeUnits::All,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_coreml_model_format(raw: Option<&str>) -> CoreMLModelFormat {
+    match raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mlprogram") | Some("ml_program") | Some("ml-program") => CoreMLModelFormat::MLProgram,
+        _ => CoreMLModelFormat::NeuralNetwork,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn format_coreml_device_label(compute_units: CoreMLComputeUnits) -> String {
+    match compute_units {
+        CoreMLComputeUnits::All => "CoreML (Automatic)".to_owned(),
+        CoreMLComputeUnits::CPUAndNeuralEngine => "CoreML (Neural Engine + CPU)".to_owned(),
+        CoreMLComputeUnits::CPUAndGPU => "CoreML (GPU + CPU)".to_owned(),
+        CoreMLComputeUnits::CPUOnly => "CoreML (CPU only)".to_owned(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn coreml_model_cache_dir(settings: CoreMLSettings) -> Option<PathBuf> {
+    let base = if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join("Library/Caches/LocalTranslateApp/coreml")
+    } else {
+        std::env::temp_dir().join("LocalTranslateApp/coreml")
+    };
+    let path = base.join(coreml_cache_namespace(settings));
+
+    std::fs::create_dir_all(&path).ok()?;
+    Some(path)
+}
+
+#[cfg(target_os = "macos")]
+fn coreml_cache_namespace(settings: CoreMLSettings) -> String {
+    format!(
+        "units-{}_format-{}_shapes-{}",
+        coreml_compute_units_slug(settings.compute_units),
+        coreml_model_format_slug(settings.model_format),
+        if settings.static_input_shapes {
+            "static"
+        } else {
+            "dynamic"
+        }
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn coreml_compute_units_slug(compute_units: CoreMLComputeUnits) -> &'static str {
+    match compute_units {
+        CoreMLComputeUnits::All => "all",
+        CoreMLComputeUnits::CPUAndNeuralEngine => "ane",
+        CoreMLComputeUnits::CPUAndGPU => "gpu",
+        CoreMLComputeUnits::CPUOnly => "cpu",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn coreml_model_format_slug(model_format: CoreMLModelFormat) -> &'static str {
+    match model_format {
+        CoreMLModelFormat::MLProgram => "mlprogram",
+        CoreMLModelFormat::NeuralNetwork => "neuralnetwork",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_coreml_runtime_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("CoreMLExecutionProvider")
+            || message.contains("Unable to compute the prediction using a neural network model")
+            || (message.contains("CoreML") && message.contains("error code: -1"))
+    })
+}
+
+fn parse_env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => false,
+            "1" | "true" | "yes" | "on" => true,
+            _ => default,
+        })
+        .unwrap_or(default)
+}
+
+fn coreml_debug_enabled() -> bool {
+    parse_env_bool("TRANSLATE_COREML_DEBUG", false)
+}
+
 fn parse_env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -347,22 +686,47 @@ fn parse_env_usize(name: &str, default: usize, min: usize, max: usize) -> usize 
         .unwrap_or(default)
 }
 
+fn summarize_i64_tensor(name: &str, values: &[i64], shape: &[usize]) -> String {
+    let min = values.iter().copied().min().unwrap_or_default();
+    let max = values.iter().copied().max().unwrap_or_default();
+    format!("{name}=i64{:?} min={min} max={max}", shape)
+}
+
+fn summarize_f32_shape(name: &str, shape: &[usize]) -> String {
+    format!("{name}=f32{:?}", shape)
+}
+
+fn log_session_io(label: &str, session: &Session) {
+    eprintln!("CoreML debug: session `{label}` inputs:");
+    for input in session.inputs() {
+        eprintln!("  - {}: {}", input.name(), input.dtype());
+    }
+    eprintln!("CoreML debug: session `{label}` outputs:");
+    for output in session.outputs() {
+        eprintln!("  - {}: {}", output.name(), output.dtype());
+    }
+}
+
 fn load_model_pair<F>(
     api: &Api,
     cache: &Cache,
     onnx_repo_id: &str,
     base_repo_id: &str,
+    runtime_backend: RuntimeBackend,
     tracker: &mut ModelLoadProgressTracker<'_, F>,
 ) -> Result<ModelBundle>
 where
     F: FnMut(StartupProgress),
 {
-    let encoder_path = resolve_model_file(api, cache, onnx_repo_id, "onnx/encoder_model.onnx", tracker)
-        .with_context(|| format!("Could not fetch encoder ONNX file from {onnx_repo_id}"))?;
-    let decoder_path = resolve_model_file(api, cache, onnx_repo_id, "onnx/decoder_model.onnx", tracker)
-        .with_context(|| format!("Could not fetch decoder ONNX file from {onnx_repo_id}"))?;
-    let tokenizer_json_path = resolve_model_file(api, cache, onnx_repo_id, "tokenizer.json", tracker)
-        .with_context(|| format!("Could not fetch tokenizer.json from {onnx_repo_id}"))?;
+    let encoder_path =
+        resolve_model_file(api, cache, onnx_repo_id, "onnx/encoder_model.onnx", tracker)
+            .with_context(|| format!("Could not fetch encoder ONNX file from {onnx_repo_id}"))?;
+    let decoder_path =
+        resolve_model_file(api, cache, onnx_repo_id, "onnx/decoder_model.onnx", tracker)
+            .with_context(|| format!("Could not fetch decoder ONNX file from {onnx_repo_id}"))?;
+    let tokenizer_json_path =
+        resolve_model_file(api, cache, onnx_repo_id, "tokenizer.json", tracker)
+            .with_context(|| format!("Could not fetch tokenizer.json from {onnx_repo_id}"))?;
     let source_spm_path = resolve_model_file(api, cache, base_repo_id, "source.spm", tracker)
         .with_context(|| format!("Could not fetch source.spm from {base_repo_id}"))?;
     let target_spm_path = resolve_model_file(api, cache, base_repo_id, "target.spm", tracker)
@@ -370,18 +734,18 @@ where
     let vocab_path = resolve_model_file(api, cache, base_repo_id, "vocab.json", tracker)
         .with_context(|| format!("Could not fetch vocab.json from {base_repo_id}"))?;
 
-    let encoder = Session::builder()?
-        .with_optimization_level(GraphOptimizationLevel::All)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .with_parallel_execution(true)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .commit_from_file(&encoder_path)?;
-    let decoder = Session::builder()?
-        .with_optimization_level(GraphOptimizationLevel::All)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .with_parallel_execution(true)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .commit_from_file(&decoder_path)?;
+    let (encoder, decoder) = build_model_sessions(&encoder_path, &decoder_path, runtime_backend)
+        .with_context(|| {
+            format!(
+                "Could not create ONNX sessions for {onnx_repo_id} with backend {}",
+                runtime_backend.label()
+            )
+        })?;
+    #[cfg(target_os = "macos")]
+    if matches!(runtime_backend, RuntimeBackend::CoreML { .. }) && coreml_debug_enabled() {
+        log_session_io(&format!("{onnx_repo_id} encoder"), &encoder);
+        log_session_io(&format!("{onnx_repo_id} decoder"), &decoder);
+    }
     let source_tokenizer =
         load_sentencepiece_tokenizer(&source_spm_path, &vocab_path, base_repo_id)
             .with_context(|| format!("Source tokenizer could not be loaded ({base_repo_id})"))?;
@@ -393,6 +757,8 @@ where
     Ok(ModelBundle {
         encoder,
         decoder,
+        encoder_path,
+        decoder_path,
         source_tokenizer,
         target_tokenizer,
         pad_token_id,
@@ -553,8 +919,7 @@ impl<F: FnMut(StartupProgress)> Progress for HubDownloadProgress<'_, '_, F> {
 
     fn finish(&mut self) {
         self.downloaded = self.total_size;
-        self.tracker
-            .finish_download(&self.repo_id, &self.filename);
+        self.tracker.finish_download(&self.repo_id, &self.filename);
     }
 }
 
@@ -757,6 +1122,15 @@ fn translate_chunk(
 ) -> Result<String> {
     let src_ids = encode_source_ids(&model.source_tokenizer, model.eos_token_id, text)?;
     let src_mask: Vec<i64> = vec![1; src_ids.len()];
+    if coreml_debug_enabled() {
+        eprintln!(
+            "CoreML debug: translate_chunk chars={} src_tokens={} beams={} max_new_tokens={}",
+            text.chars().count(),
+            src_ids.len(),
+            decoder_config.num_beams,
+            decoder_config.max_new_tokens
+        );
+    }
     let encoder_hidden = run_encoder(&mut model.encoder, &src_ids, &src_mask)?;
 
     if decoder_config.num_beams <= 1 {
@@ -785,12 +1159,19 @@ fn translate_chunk(
 fn run_encoder(encoder: &mut Session, src_ids: &[i64], src_mask: &[i64]) -> Result<Array3<f32>> {
     let ids = Array2::from_shape_vec((1, src_ids.len()), src_ids.to_vec())?;
     let mask = Array2::from_shape_vec((1, src_mask.len()), src_mask.to_vec())?;
+    let ids_summary = summarize_i64_tensor("input_ids", src_ids, &[1, src_ids.len()]);
+    let mask_summary = summarize_i64_tensor("attention_mask", src_mask, &[1, src_mask.len()]);
+    if coreml_debug_enabled() {
+        eprintln!("CoreML debug: encoder inputs: {ids_summary}; {mask_summary}");
+    }
     let ids_t = TensorRef::from_array_view(ids.view()).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mask_t = TensorRef::from_array_view(mask.view()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let out = encoder.run(ort::inputs![
-        "input_ids" => ids_t,
-        "attention_mask" => mask_t
-    ])?;
+    let out = encoder
+        .run(ort::inputs![
+            "input_ids" => ids_t,
+            "attention_mask" => mask_t
+        ])
+        .with_context(|| format!("Encoder inference failed with {ids_summary}; {mask_summary}"))?;
 
     Ok(out["last_hidden_state"]
         .try_extract_array::<f32>()
@@ -962,12 +1343,51 @@ where
     let hidden_t = TensorRef::from_array_view(hidden_view).map_err(|e| anyhow::anyhow!("{e}"))?;
     let enc_mask_t = TensorRef::from_array_view(encoder_attention_mask.view())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let target_summary = summarize_i64_tensor(
+        "input_ids",
+        target.as_slice().unwrap_or(&[]),
+        &[beam_count, target.ncols()],
+    );
+    let hidden_summary = summarize_f32_shape(
+        "encoder_hidden_states",
+        &[
+            hidden_view.dim().0,
+            hidden_view.dim().1,
+            hidden_view.dim().2,
+        ],
+    );
+    let enc_mask_summary = summarize_i64_tensor(
+        "encoder_attention_mask",
+        encoder_attention_mask.as_slice().unwrap_or(&[]),
+        &[beam_count, src_mask.len()],
+    );
+    if coreml_debug_enabled() {
+        eprintln!(
+            "CoreML debug: decoder inputs: beam_count={} target_len={}; {}; {}; {}",
+            beam_count,
+            target.ncols(),
+            target_summary,
+            hidden_summary,
+            enc_mask_summary
+        );
+    }
 
-    let out = decoder.run(ort::inputs![
-        "input_ids" => target_t,
-        "encoder_hidden_states" => hidden_t,
-        "encoder_attention_mask" => enc_mask_t
-    ])?;
+    let out = decoder
+        .run(ort::inputs![
+            "input_ids" => target_t,
+            "encoder_hidden_states" => hidden_t,
+            "encoder_attention_mask" => enc_mask_t
+        ])
+        .with_context(|| {
+            format!(
+                "Decoder inference failed at beam_count={} target_len={} with {}; {}; {}",
+                beam_count,
+                target.ncols(),
+                target_summary,
+                hidden_summary,
+                enc_mask_summary
+            )
+        })?;
     let logits = out["logits"]
         .try_extract_array::<f32>()
         .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -1180,12 +1600,18 @@ enum LayoutSegment {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecoderConfig, TranslationLayout, parse_env_usize};
+    use super::{DecoderConfig, TranslationLayout, parse_env_bool, parse_env_usize};
     #[cfg(target_os = "windows")]
     use super::{
         MICROSOFT_VENDOR_ID, NVIDIA_VENDOR_ID, format_directml_device_label,
         score_adapter_for_directml,
     };
+    #[cfg(target_os = "macos")]
+    use super::{
+        format_coreml_device_label, parse_coreml_compute_units, parse_coreml_model_format,
+    };
+    #[cfg(target_os = "macos")]
+    use ort::ep::coreml::{ComputeUnits as CoreMLComputeUnits, ModelFormat as CoreMLModelFormat};
 
     #[cfg(target_os = "windows")]
     fn adapter_info(name: &str, vendor: u32, device_type: wgpu::DeviceType) -> wgpu::AdapterInfo {
@@ -1221,6 +1647,58 @@ mod tests {
     fn env_parser_uses_default_when_value_missing() {
         assert_eq!(parse_env_usize("MISSING_ENV", 12, 4, 24), 12);
         assert_eq!(DecoderConfig::default().num_beams, 4);
+        assert!(parse_env_bool("MISSING_BOOL_ENV", true));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn coreml_compute_units_parser_supports_shortcuts() {
+        assert_eq!(
+            parse_coreml_compute_units(Some("ane")),
+            CoreMLComputeUnits::CPUAndNeuralEngine
+        );
+        assert_eq!(
+            parse_coreml_compute_units(Some("gpu")),
+            CoreMLComputeUnits::CPUAndGPU
+        );
+        assert_eq!(
+            parse_coreml_compute_units(Some("cpu")),
+            CoreMLComputeUnits::CPUOnly
+        );
+        assert_eq!(
+            parse_coreml_compute_units(Some("bogus")),
+            CoreMLComputeUnits::All
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn coreml_device_label_reflects_selected_compute_units() {
+        assert_eq!(
+            format_coreml_device_label(CoreMLComputeUnits::CPUAndNeuralEngine),
+            "CoreML (Neural Engine + CPU)"
+        );
+        assert_eq!(
+            format_coreml_device_label(CoreMLComputeUnits::CPUOnly),
+            "CoreML (CPU only)"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn coreml_model_format_parser_supports_mlprogram() {
+        assert_eq!(
+            parse_coreml_model_format(Some("mlprogram")),
+            CoreMLModelFormat::MLProgram
+        );
+        assert_eq!(
+            parse_coreml_model_format(Some("ml-program")),
+            CoreMLModelFormat::MLProgram
+        );
+        assert_eq!(
+            parse_coreml_model_format(Some("bogus")),
+            CoreMLModelFormat::NeuralNetwork
+        );
     }
 
     #[cfg(target_os = "windows")]
