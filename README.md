@@ -106,7 +106,7 @@ At startup, the application looks for `nvcuda.dll` (shipped with the NVIDIA driv
 
 ### 🎬 Demo
 
-<video src="docs/HowToUse.mp4" controls autoplay loop muted width="100%"></video>
+> 📹 [Watch the demo video](docs/HowToUse.mp4)
 
 ### Steps
 
